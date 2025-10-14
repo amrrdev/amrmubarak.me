@@ -1,6 +1,6 @@
 ---
 title: "Object-Oriented Programming: The Mental Model You're Missing"
-date: "2025-10-15"
+date: "2025-10-14"
 readTime: "15 min read"
 ---
 
