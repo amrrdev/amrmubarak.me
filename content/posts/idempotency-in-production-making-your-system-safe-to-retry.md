@@ -19,7 +19,7 @@ f(x) = x * 0; // idempotent: 0 * 0 = 0, 0 * 0 = 0
 f(x) = x + 1; // not idempotent: f(5) = 6, f(6) = 7
 ```
 
-In backend systems, idempotency means: if you make the same request multiple times, it has the same effect as making it once. The system recognizes that you're asking for the same thing and doesn't do the work twice.
+In backend systems, Idempotency means that performing the same operation multiple times has the same effect as performing it once. The system recognizes that you're asking for the same thing and doesn't do the work twice.
 
 **Example:**
 
