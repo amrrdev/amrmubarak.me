@@ -1,7 +1,7 @@
 ---
 title: "Consistency and Data Models in Real Life: The Art of Building Systems That Never Lie to You"
 date: "2025-10-17"
-readTime: "17 min read"
+readTime: "22 min read"
 ---
 
 ## The World Your System Actually Lives In
