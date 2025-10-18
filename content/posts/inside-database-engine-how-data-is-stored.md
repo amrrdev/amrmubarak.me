@@ -40,7 +40,7 @@ This problem is why databases use slotted pages.
 
 A slotted page looks like this on disk:
 
-```
+```ts
 [Page Header]
 [                    Free Space                    ]
 [Slot Directory Growing Upward: [Slot 3][Slot 2][Slot 1]]
@@ -52,7 +52,7 @@ The slot directory is the innovation that solves the fragmentation problem. Each
 
 Here's why that matters. Suppose you have this page:
 
-```
+```ts
 Slot 1: offset=100, size=50   -> Row 1 is 50 bytes starting at position 100
 Slot 2: offset=160, size=40   -> Row 2 is 40 bytes starting at position 160
 Slot 3: offset=210, size=60   -> Row 3 is 60 bytes starting at position 210
@@ -62,7 +62,7 @@ Now you delete row 2. What happens? PostgreSQL marks the slot as dead (sets the 
 
 When you insert row 4 (35 bytes), PostgreSQL can reuse the space where row 2 was:
 
-```
+```ts
 Slot 1: offset=100, size=50
 Slot 2: DEAD
 Slot 3: offset=210, size=60
@@ -151,7 +151,7 @@ Within each block, the keys are sorted. The SSTable also has a block index that 
 
 The structure looks roughly like:
 
-```
+```ts
 [Block 1: compressed data]
 [Block 2: compressed data]
 ...
