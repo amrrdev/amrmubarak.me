@@ -26,7 +26,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
   return (
     <div className="min-h-screen">
       <Header />
-      <main className="mx-auto max-w-[1000px] px-6 py-16 md:py-20">
+      <main className="mx-auto max-w-3xl px-6 py-16 md:py-20">
         <Link
           href="/"
           className="mb-12 inline-flex items-center text-[13px] text-muted-foreground transition-colors hover:text-foreground"

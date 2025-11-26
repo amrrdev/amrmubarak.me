@@ -5,7 +5,7 @@ export default function Home() {
   return (
     <div className="min-h-screen">
       <Header />
-      <main className="mx-auto max-w-[1000px] px-6 py-16">
+      <main className="mx-auto max-w-3xl px-6 py-16 md:py-20">
         <div className="grid gap-16 lg:grid-cols-[2fr_1fr]">
           <div>
             <h1 className="mb-8 text-3xl font-bold tracking-tight text-foreground">
