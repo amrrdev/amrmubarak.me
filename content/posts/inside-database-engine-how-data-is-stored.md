@@ -2,6 +2,7 @@
 title: "How Databases Actually Store Data: Pages, Tuples, and the Architecture That Matters"
 date: "2025-10-20"
 readTime: "17 min read"
+category: "Database Internals"
 ---
 
 There's a gap between understanding how SQL works and understanding how databases actually store bits on disk. Most developers never cross that gap. Their databases just work until they don't, and then they're stuck guessing at why performance degraded or why they're burning through disk space.

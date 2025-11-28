@@ -2,6 +2,7 @@
 title: "Idempotency in Production: Making Your System Safe to Retry"
 date: "2025-10-16"
 readTime: "17 min read"
+category: "System Design"
 ---
 
 ## The Real Cost - What happens when you don't have idempotency

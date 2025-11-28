@@ -2,6 +2,7 @@
 title: "Consistency and Data Models in Real Life: The Art of Building Systems That Never Lie to You"
 date: "2025-10-17"
 readTime: "22 min read"
+category: "Distributed Systems"
 ---
 
 ## The World Your System Actually Lives In

@@ -2,6 +2,7 @@
 title: "Distributed Transactions: The Hard Truth About Keeping Multiple Systems in Sync"
 date: "2025-11-28"
 readTime: "12 min read"
+category: "Distributed Systems"
 ---
 
 ## Why Single-Database Transactions Don't Scale
@@ -154,7 +155,7 @@ Stripe has a two-step payment flow for exactly this reason.
 
 **Wrong way:**
 
-```
+```md
 1. Charge customer
 2. Update order in database
 3. If database fails: Refund customer
@@ -164,7 +165,7 @@ Problem: Refunds aren't instant. The customer was charged. Minutes or hours late
 
 **Right way:**
 
-```
+```md
 1. Create PaymentIntent (authorized, not charged)
 2. Update order in database
 3. If database succeeds: Capture PaymentIntent (charge)
@@ -181,7 +182,7 @@ Sagas require retries. Payment succeeds but you don't get the response. Did it s
 
 The fix: idempotency keys. Send a unique key with each request. If you retry with the same key, the system returns the previous result instead of executing again.
 
-```
+```ts
 POST /charges
 {
   "amount": 5000,

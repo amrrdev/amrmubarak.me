@@ -2,6 +2,7 @@
 title: "ACID Properties and Isolation Levels: Deep Dive into Production Database Behavior"
 date: "2025-10-16"
 readTime: "17 min read"
+category: "Database Internals"
 ---
 
 ## Why This Matters in Production

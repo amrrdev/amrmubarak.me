@@ -6,6 +6,7 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { getAllSlugs, getPostBySlug } from "@/lib/posts";
+import { CategoryBadge } from "@/components/category-badge";
 import "highlight.js/styles/github-dark.css";
 
 export function generateStaticParams() {
@@ -36,16 +37,18 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
 
         <article>
           <header className="mb-12">
-            <div className="mb-4 flex items-center gap-3 text-[13px] text-muted-foreground">
-              <time dateTime={post.date}>
+            <div className="mb-4 flex items-center gap-3 text-[13px]">
+              <CategoryBadge category={post.category} variant="large" />
+              <span className="text-muted-foreground">·</span>
+              <time dateTime={post.date} className="text-muted-foreground">
                 {new Date(post.date).toLocaleDateString("en-US", {
                   year: "numeric",
                   month: "short",
                   day: "numeric",
                 })}
               </time>
-              <span>·</span>
-              <span>{post.readTime}</span>
+              <span className="text-muted-foreground">·</span>
+              <span className="text-muted-foreground">{post.readTime}</span>
             </div>
             <h1 className="text-balance text-[28px] font-medium leading-tight tracking-tight text-foreground md:text-[32px]">
               {post.title}

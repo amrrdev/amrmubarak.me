@@ -2,6 +2,7 @@
 title: "Replication Strategies in Distributed Databases: What Actually Happens When You Copy Your Data"
 date: "2025-11-26"
 readTime: "10 min read"
+category: "Distributed Systems"
 ---
 
 ## Why Replication Exists

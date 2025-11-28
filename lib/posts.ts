@@ -9,6 +9,7 @@ export interface Post {
   title: string;
   date: string;
   readTime: string;
+  category: string;
   content: string;
 }
 
@@ -28,6 +29,7 @@ export function getAllPosts(): Post[] {
         title: data.title,
         date: data.date,
         readTime: data.readTime || "5 min read",
+        category: data.category || "Uncategorized",
         content,
       };
     });
@@ -47,6 +49,7 @@ export function getPostBySlug(slug: string): Post | null {
       title: data.title,
       date: data.date,
       readTime: data.readTime || "5 min read",
+      category: data.category || "Uncategorized",
       content,
     };
   } catch (error) {
@@ -59,4 +62,10 @@ export function getAllSlugs(): string[] {
   return fileNames
     .filter((fileName) => fileName.endsWith(".md"))
     .map((fileName) => fileName.replace(/\.md$/, ""));
+}
+
+export function getAllCategories(): string[] {
+  const posts = getAllPosts();
+  const categories = new Set(posts.map((post) => post.category));
+  return Array.from(categories).sort();
 }

@@ -2,6 +2,7 @@
 title: "Database Indexing Strategies for High-Performance Systems"
 date: "2025-10-14"
 readTime: "15 min read"
+category: "Database Internals"
 ---
 
 You know that feeling when you're searching for a specific book in a library with thousands of volumes, and there's no catalog system? That's basically what your database experiences every time you run a query without proper indexing. Except instead of thousands of books, we're talking millions or billions of rows, and instead of minutes, we're burning milliseconds that add up into frustrated users and skyrocketing infrastructure costs.
