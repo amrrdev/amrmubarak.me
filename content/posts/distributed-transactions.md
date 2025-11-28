@@ -115,8 +115,9 @@ Inventory service listens -> doesn't reduce stock (or increases it back if it al
 
 **Orchestration:** One service coordinates everything.
 
-```
+```md
 Order Orchestrator:
+
 1. Call payment service: Charge card
 2. If success: Call inventory service: Reduce stock
 3. If success: Call shipping service: Create shipment
