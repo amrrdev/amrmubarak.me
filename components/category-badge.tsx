@@ -19,6 +19,11 @@ const categoryColors: Record<string, { bg: string; text: string; border: string 
     text: "text-emerald-400",
     border: "border-emerald-500/30",
   },
+  "AI Engineering": {
+    bg: "bg-amber-500/10",
+    text: "text-amber-400",
+    border: "border-amber-500/30",
+  },
   Uncategorized: {
     bg: "bg-muted/50",
     text: "text-muted-foreground",

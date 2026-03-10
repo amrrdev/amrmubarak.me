@@ -19,6 +19,8 @@ export const metadata: Metadata = {
   generator: "v0.app",
 };
 
+const enableVercelAnalytics = process.env.NEXT_PUBLIC_ENABLE_VERCEL_ANALYTICS === "true";
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -29,7 +31,7 @@ export default function RootLayout({
       <body className={`${jetbrainsMono.variable} font-mono antialiased`}>
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
           <Suspense fallback={<div>Loading...</div>}>{children}</Suspense>
-          <Analytics />
+          {enableVercelAnalytics ? <Analytics /> : null}
         </ThemeProvider>
       </body>
     </html>

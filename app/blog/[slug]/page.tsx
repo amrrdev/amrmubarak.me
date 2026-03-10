@@ -152,7 +152,9 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                     <img
                       src={src || "/placeholder.svg"}
                       alt={alt || ""}
-                      className="my-6 rounded-md"
+                      loading="lazy"
+                      decoding="async"
+                      className="my-8 w-full rounded-xl border border-border/40 bg-background shadow-sm"
                     />
                   ),
                   table: ({ children }: { children: React.ReactNode }) => (

@@ -1,9 +1,9 @@
 "use client";
 
 import Link from "next/link";
-import { Post } from "@/lib/posts";
 import { CategoryBadge } from "./category-badge";
 import { useState } from "react";
+import type { Post } from "@/lib/posts";
 
 interface BlogListProps {
   posts: Post[];
