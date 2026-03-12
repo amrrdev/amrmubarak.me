@@ -1,7 +1,5 @@
 "use client";
 
-import { useState } from "react";
-
 interface CategoryFilterProps {
   categories: string[];
   selectedCategory: string;
@@ -10,10 +8,10 @@ interface CategoryFilterProps {
 
 const categoryColors: Record<string, string> = {
   "Distributed Systems":
-    "bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border-purple-500/40",
-  "Database Internals": "bg-blue-500/20 hover:bg-blue-500/30 text-blue-300 border-blue-500/40",
-  "System Design":
-    "bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border-emerald-500/40",
+    "bg-amber-500/20 hover:bg-amber-500/30 text-amber-700 dark:text-amber-300 border-amber-500/40",
+  "Database Internals":
+    "bg-teal-500/20 hover:bg-teal-500/30 text-teal-700 dark:text-teal-300 border-teal-500/40",
+  "System Design": "bg-sky-500/20 hover:bg-sky-500/30 text-sky-700 dark:text-sky-300 border-sky-500/40",
 };
 
 export function CategoryFilter({
@@ -22,13 +20,13 @@ export function CategoryFilter({
   onCategoryChange,
 }: CategoryFilterProps) {
   return (
-    <div className="mb-10 flex flex-wrap gap-2.5">
+    <div className="mb-10 flex flex-wrap gap-2">
       <button
         onClick={() => onCategoryChange("all")}
-        className={`rounded-full border px-5 py-2 text-[13px] font-medium transition-all duration-200 ${
+        className={`rounded-full border px-4 py-2 text-[12px] font-medium transition ${
           selectedCategory === "all"
-            ? "border-accent bg-accent/15 text-accent shadow-sm shadow-accent/20"
-            : "border-border/50 bg-card text-muted-foreground hover:border-accent/50 hover:bg-card/80 hover:text-foreground"
+            ? "border-accent/50 bg-accent/15 text-accent shadow-sm"
+            : "border-border/60 bg-card/70 text-muted-foreground hover:border-accent/40 hover:text-foreground"
         }`}
       >
         All Posts
@@ -43,10 +41,10 @@ export function CategoryFilter({
           <button
             key={category}
             onClick={() => onCategoryChange(category)}
-            className={`rounded-full border px-5 py-2 text-[13px] font-medium transition-all duration-200 ${
+            className={`rounded-full border px-4 py-2 text-[12px] font-medium transition ${
               isSelected
                 ? colorClass + " shadow-sm"
-                : "border-border/50 bg-card text-muted-foreground hover:border-accent/50 hover:bg-card/80 hover:text-foreground"
+                : "border-border/60 bg-card/70 text-muted-foreground hover:border-accent/40 hover:text-foreground"
             }`}
           >
             {category}

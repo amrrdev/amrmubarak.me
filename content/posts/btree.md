@@ -1,4 +1,9 @@
-# Implementing a B-Tree in TypeScript: What Actually Happens When Databases Index Your Data
+---
+title: "Implementing a B-Tree in TypeScript: What Actually Happens When Databases Index Your Data"
+date: "2026-3-10"
+readTime: "10 min read"
+category: "Database Internals"
+---
 
 ## Why B-Trees Exist
 

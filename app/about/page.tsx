@@ -4,10 +4,17 @@ export default function About() {
   return (
     <div className="min-h-screen">
       <Header />
-      <main className="mx-auto max-w-2xl px-6 py-12">
-        <h1 className="mb-8 text-2xl font-medium text-foreground">About</h1>
+      <main className="mx-auto max-w-3xl px-6 py-16 md:py-20">
+        <div className="mb-10 space-y-3">
+          <p className="text-[12px] font-semibold uppercase tracking-[0.3em] text-muted-foreground">
+            About
+          </p>
+          <h1 className="text-3xl font-semibold text-foreground md:text-4xl">
+            Writing with a systems lens.
+          </h1>
+        </div>
 
-        <div className="space-y-4 text-[15px] leading-relaxed text-muted-foreground">
+        <div className="space-y-5 font-serif text-[17px] leading-relaxed text-muted-foreground">
           <p>
             I'm a distributed systems engineer with a passion for building reliable, scalable
             infrastructure. I spend my days thinking about consensus algorithms, database internals,

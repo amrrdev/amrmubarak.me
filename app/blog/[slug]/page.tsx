@@ -29,61 +29,65 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
       <Header />
       <main className="mx-auto max-w-3xl px-6 py-16 md:py-20">
         <Link
-          href="/"
-          className="mb-12 inline-flex items-center text-[13px] text-muted-foreground transition-colors hover:text-foreground"
+          href="/blog"
+          className="mb-12 inline-flex items-center text-[12px] font-semibold uppercase tracking-[0.2em] text-muted-foreground transition-colors hover:text-foreground"
         >
-          ← Back
+          {"<- Back to blog"}
         </Link>
 
         <article>
-          <header className="mb-12">
-            <div className="mb-4 flex items-center gap-3 text-[13px]">
+          <header className="mb-12 space-y-4">
+            <div className="flex flex-wrap items-center gap-3 text-[12px] text-muted-foreground">
               <CategoryBadge category={post.category} variant="large" />
-              <span className="text-muted-foreground">·</span>
-              <time dateTime={post.date} className="text-muted-foreground">
+              <span className="text-border">|</span>
+              <time dateTime={post.date}>
                 {new Date(post.date).toLocaleDateString("en-US", {
                   year: "numeric",
                   month: "short",
                   day: "numeric",
                 })}
               </time>
-              <span className="text-muted-foreground">·</span>
-              <span className="text-muted-foreground">{post.readTime}</span>
+              <span className="text-border">|</span>
+              <span>{post.readTime}</span>
             </div>
-            <h1 className="text-balance text-[28px] font-medium leading-tight tracking-tight text-foreground md:text-[32px]">
+            <h1 className="text-balance text-[32px] font-semibold leading-tight tracking-tight text-foreground md:text-[38px]">
               {post.title}
             </h1>
           </header>
 
-          <div className="prose-custom">
+          <div className="prose-custom text-[17px] leading-relaxed text-foreground/92">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               rehypePlugins={[rehypeHighlight]}
               components={
                 {
                   h2: ({ children }: { children: React.ReactNode }) => (
-                    <h2 className="mb-4 mt-12 text-[20px] font-medium leading-tight text-foreground first:mt-0">
+                    <h2 className="mb-4 mt-12 text-[24px] font-semibold leading-tight text-foreground first:mt-0">
                       {children}
                     </h2>
                   ),
                   h3: ({ children }: { children: React.ReactNode }) => (
-                    <h3 className="mb-3 mt-10 text-[17px] font-medium leading-tight text-foreground">
+                    <h3 className="mb-3 mt-10 text-[20px] font-semibold leading-tight text-foreground">
                       {children}
                     </h3>
                   ),
                   p: ({ children }: { children: React.ReactNode }) => (
-                    <p className="mb-5 text-[15px] leading-relaxed text-foreground/85">
+                    <p className="mb-6 font-serif text-[17px] leading-relaxed text-foreground/92">
                       {children}
                     </p>
                   ),
                   ul: ({ children }: { children: React.ReactNode }) => (
-                    <ul className="my-6 space-y-2 pl-5">{children}</ul>
+                    <ul className="my-6 space-y-2 pl-5 font-serif text-[17px] leading-relaxed text-foreground/92">
+                      {children}
+                    </ul>
                   ),
                   ol: ({ children }: { children: React.ReactNode }) => (
-                    <ol className="my-6 space-y-2 pl-5 list-decimal">{children}</ol>
+                    <ol className="my-6 space-y-2 pl-5 font-serif text-[17px] leading-relaxed text-foreground/92 list-decimal">
+                      {children}
+                    </ol>
                   ),
                   li: ({ children }: { children: React.ReactNode }) => (
-                    <li className="relative text-[15px] leading-relaxed text-foreground/85">
+                    <li className="relative text-[17px] leading-relaxed text-foreground/92">
                       {children}
                     </li>
                   ),
@@ -91,7 +95,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                     if (inline) {
                       return (
                         <code
-                          className="rounded bg-muted px-1.5 py-0.5 text-[13.5px] font-mono text-accent border border-border/40"
+                          className="rounded bg-muted/60 px-1.5 py-0.5 text-[13.5px] font-mono text-foreground border border-border/40"
                           style={{
                             fontFamily:
                               "'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', monospace",
@@ -101,7 +105,6 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                         </code>
                       );
                     }
-                    // For code blocks, let rehype-highlight handle the styling
                     return (
                       <code
                         className={className}
@@ -117,7 +120,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                   },
                   pre: ({ children }: { children: React.ReactNode }) => (
                     <pre
-                      className="my-6 overflow-x-auto rounded-lg border border-border/40 bg-[#0d1117] p-4 text-[14px] leading-[1.7] shadow-sm"
+                      className="code-block my-7 overflow-x-auto rounded-2xl border p-5 text-[14px] leading-[1.7] shadow-sm"
                       style={{
                         fontFamily:
                           "'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', monospace",
@@ -129,7 +132,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                   a: ({ href, children }: { href?: string; children: React.ReactNode }) => (
                     <a
                       href={href}
-                      className="text-accent underline decoration-accent/30 underline-offset-2 transition-colors hover:decoration-accent"
+                      className="text-accent underline decoration-accent/40 underline-offset-4 transition-colors hover:decoration-accent"
                       target={href?.startsWith("http") ? "_blank" : undefined}
                       rel={href?.startsWith("http") ? "noopener noreferrer" : undefined}
                     >
@@ -137,13 +140,13 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                     </a>
                   ),
                   strong: ({ children }: { children: React.ReactNode }) => (
-                    <strong className="font-medium text-foreground">{children}</strong>
+                    <strong className="font-semibold text-foreground">{children}</strong>
                   ),
                   em: ({ children }: { children: React.ReactNode }) => (
                     <em className="italic text-foreground/90">{children}</em>
                   ),
                   blockquote: ({ children }: { children: React.ReactNode }) => (
-                    <blockquote className="my-6 border-l-2 border-accent/30 pl-4 italic text-foreground/75">
+                    <blockquote className="my-8 border-l-2 border-accent/40 pl-5 font-serif text-[18px] italic text-foreground/75">
                       {children}
                     </blockquote>
                   ),
@@ -154,7 +157,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                       alt={alt || ""}
                       loading="lazy"
                       decoding="async"
-                      className="my-8 w-full rounded-xl border border-border/40 bg-background shadow-sm"
+                      className="my-8 w-full rounded-2xl border border-border/40 bg-background shadow-sm"
                     />
                   ),
                   table: ({ children }: { children: React.ReactNode }) => (

@@ -16,7 +16,7 @@ export function ThemeToggle() {
   if (!mounted) {
     return (
       <button
-        className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground h-9 w-9"
+        className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border/60 bg-card/60 text-sm text-muted-foreground transition-colors hover:border-accent/60 hover:bg-accent/10 hover:text-foreground"
         aria-label="Toggle theme"
       >
         <Sun className="h-4 w-4" />
@@ -27,7 +27,7 @@ export function ThemeToggle() {
   return (
     <button
       onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-      className="inline-flex items-center justify-center rounded-md text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground h-9 w-9"
+      className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border/60 bg-card/60 text-sm text-muted-foreground transition-colors hover:border-accent/60 hover:bg-accent/10 hover:text-foreground"
       aria-label="Toggle theme"
     >
       {theme === "dark" ? (
