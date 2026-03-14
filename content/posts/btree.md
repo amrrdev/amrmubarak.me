@@ -1,678 +1,1032 @@
 ---
-title: "Implementing a B-Tree in TypeScript: What Actually Happens When Databases Index Your Data"
+title: "Implementing a B+ Tree in Go: What Databases Actually Use"
 date: "2026-3-10"
 readTime: "10 min read"
 category: "Database Internals"
 ---
 
-## Why B-Trees Exist
+## Why B+ Trees Exist
 
-Your database has 50 million rows. You query by user ID. Without an index, the database reads every row, one by one, until it finds yours. That's a full table scan. It's slow. It gets slower as you add more data.
+Your database has 50 million rows. You query by user ID. Without an index, the database reads every row until it finds yours. That's a full table scan. It gets slower with every row you add.
 
-So you build an index. An index is a separate data structure that maps keys to row locations. Instead of scanning 50 million rows, you look up the key in the index, get a pointer, jump straight to the row.
+So you build an index. The question is: what data structure?
 
-The question is: what data structure do you use for the index?
+Not a hash map. Hash maps are fast for exact lookups but useless for range queries. `WHERE age BETWEEN 20 AND 30` needs something sorted.
 
-Not a hash map. Hash maps are fast for exact lookups but useless for range queries. `WHERE age BETWEEN 20 AND 30` needs a structure that keeps data sorted.
+Not a binary search tree. BSTs fall apart at scale. A BST with a million nodes can be 20 levels deep. Each level is a disk read. 20 disk reads per query. Disks are slow.
 
-Not a binary search tree. BSTs work in theory but fall apart at scale. A BST with a million nodes can be 20 levels deep. Each level is a disk read. 20 disk reads per query. Disks are slow.
+B-Trees solve the depth problem — they stay 3-4 levels deep even with millions of nodes. But the variant every real database actually uses is the **B+ Tree**. PostgreSQL, MySQL, SQLite, Oracle — they all use B+ Trees for indexes.
 
-B-Trees solve this. They keep data sorted for range queries. And they stay shallow — a B-Tree with a million nodes is only 3-4 levels deep. That's 3-4 disk reads per query. Every major database — PostgreSQL, MySQL, SQLite, MongoDB — uses B-Trees or a variant for indexes.
-
-Let's build one.
+The difference matters. Let's build one in Go.
 
 ---
 
-## What a B-Tree Actually Is
+## B-Tree vs B+ Tree: The Key Difference
 
-A B-Tree is a self-balancing tree where each node holds multiple entries. Each entry is a **(key, value)** pair — the key is what you search by, the value is what you get back. In a database index, the key is the indexed column and the value is a pointer to the actual row on disk. In a general-purpose map, the value is whatever you want.
+A standard B-Tree stores data in every node — internal nodes and leaves both hold (key, value) pairs. A B+ Tree changes two things:
 
-You configure a parameter called the **order** (or minimum degree), which we'll call `t`. It controls how many entries each node can hold.
+**1. Data lives only in leaf nodes.** Internal nodes store only keys — they act as a routing layer. Every (key, value) pair is at a leaf.
 
-Every non-root node must have at least `t - 1` entries and at most `2t - 1` entries. The root can have as few as 1.
+**2. Leaf nodes are linked together.** Every leaf has a pointer to the next leaf, forming a sorted linked list across the entire bottom level of the tree.
 
-Each internal node with `n` entries has exactly `n + 1` children. Leaf nodes have no children.
+```
+B-Tree (data everywhere):
+         [10:alice | 20:bob]
+        /          |         \
+ [5:carol|6:dave] [12:eve] [30:frank]
 
-All leaves are at the same depth. That's the key property. No matter what you insert or delete, the tree stays perfectly balanced. Every search takes the exact same number of steps.
-
-Let's define the node. We use a `comparator` function to keep keys generic — any type that can be ordered works:
-
-```typescript
-type Comparator<K> = (a: K, b: K) => number;
-
-interface Entry<K, V> {
-  key: K;
-  value: V;
-}
-
-class BTreeNode<K, V> {
-  entries: Entry<K, V>[];
-  children: BTreeNode<K, V>[];
-  isLeaf: boolean;
-
-  constructor(isLeaf: boolean) {
-    this.entries = [];
-    this.children = [];
-    this.isLeaf = isLeaf;
-  }
-}
+B+ Tree (data only in leaves, leaves linked):
+         [10 | 20]              ← internal: keys only, no values
+        /    |     \
+ [5:carol]→[10:alice]→[20:bob]→[30:frank]→nil
+  6:dave     12:eve
 ```
 
-Each node holds an array of `entries` (key-value pairs), an array of `children`, and a flag for whether it's a leaf. The children array is always one longer than the entries array for internal nodes — `children[i]` holds everything less than `entries[i].key`, and `children[entries.length]` holds everything greater than the last key.
+Why does this matter?
+
+**Range queries become a single linked-list traversal.** Find the start of the range with a normal tree search, then walk the leaf linked list until the range ends. No backtracking. No re-entering the tree. PostgreSQL's index range scans work exactly this way.
+
+**Internal nodes fit more keys.** Without values, internal nodes are smaller. A smaller internal node means a higher branching factor — more children per node — which means a shallower tree. A shallower tree means fewer disk reads per lookup.
+
+**Full scans are efficient.** Walk the leaf linked list from start to finish. No tree traversal needed.
+
+> **Takeaway**: B+ Trees store data only in leaves and link leaves together. Internal nodes are pure routing. Range queries become linked-list walks. This is why every database index is a B+ Tree, not a plain B-Tree.
 
 ---
 
-## The Tree Shell
+## What a B+ Tree Actually Is
 
-```typescript
-class BTree<K, V> {
-  root: BTreeNode<K, V>;
-  t: number;
-  comparator: Comparator<K>;
+Like a B-Tree, a B+ Tree has a minimum degree `t`:
 
-  constructor(t: number, comparator: Comparator<K>) {
-    this.t = t;
-    this.comparator = comparator;
-    this.root = new BTreeNode<K, V>(true);
-  }
+- Every non-root node has at least `t-1` keys and at most `2t-1` keys.
+- Every internal node with `n` keys has exactly `n+1` children.
+- All leaves are at the same depth.
+
+The difference: internal nodes hold only keys (no values). Leaves hold `(key, value)` entries and a pointer to the next leaf.
+
+---
+
+## The Node
+
+In Go, internal nodes and leaf nodes have different responsibilities, but we represent both with one struct and use `isLeaf` to distinguish them:
+
+```go
+type Entry[K any, V any] struct {
+    Key   K
+    Value V
+}
+
+type Node[K any, V any] struct {
+    keys     []K           // routing keys (internal) or entry keys (leaf)
+    values   []V           // only used in leaf nodes
+    children []*Node[K, V] // only used in internal nodes
+    next     *Node[K, V]   // only used in leaf nodes — points to next leaf
+    isLeaf   bool
+}
+
+func newNode[K any, V any](isLeaf bool) *Node[K, V] {
+    return &Node[K, V]{isLeaf: isLeaf}
 }
 ```
 
-We pass in a `comparator` so the tree works with any key type — numbers, strings, dates, whatever. With `t = 3`, nodes hold 2 to 5 entries. With `t = 2`, you get a 2-3-4 tree — the minimum useful B-Tree.
+Internal nodes: `keys` holds routing keys, `children` holds child pointers. `values` and `next` are unused.
 
-For the examples below we'll use `(a, b) => a - b` for numeric keys.
+Leaf nodes: `keys` and `values` hold (key, value) pairs in parallel slices. `next` points to the next leaf. `children` is unused.
+
+This parallel-slice layout for leaves (`keys[i]` matches `values[i]`) keeps the leaf structure cache-friendly and easy to work with.
+
+---
+
+## The Tree
+
+```go
+type Comparator[K any] func(a, b K) int
+
+type BPlusTree[K any, V any] struct {
+    root       *Node[K, V]
+    t          int // minimum degree
+    comparator Comparator[K]
+}
+
+func NewBPlusTree[K any, V any](t int, cmp Comparator[K]) *BPlusTree[K, V] {
+    return &BPlusTree[K, V]{
+        root:       newNode[K, V](true), // start as empty leaf
+        t:          t,
+        comparator: cmp,
+    }
+}
+```
+
+We start with an empty root that is also a leaf. With `t = 3`, nodes hold 2 to 5 keys. The comparator makes the tree work with any ordered key type — pass `func(a, b int) int { return a - b }` for integers, `strings.Compare` for strings.
 
 ---
 
 ## Search
 
-Search is the simplest operation. Start at the root. At each node, find where the key would be. If it's there, return the value. If not, go into the right child.
+Search walks down internal nodes using keys as routing guides, then scans the leaf:
 
-```typescript
-search(node: BTreeNode<K, V>, key: K): V | null {
-  let i = 0;
+```go
+func (tree *BPlusTree[K, V]) Search(key K) (V, bool) {
+    leaf := tree.findLeaf(key)
+    for i, k := range leaf.keys {
+        cmp := tree.comparator(key, k)
+        if cmp == 0 {
+            return leaf.values[i], true
+        }
+        if cmp < 0 {
+            break
+        }
+    }
+    var zero V
+    return zero, false
+}
 
-  // Find the first entry whose key is >= what we're looking for
-  while (i < node.entries.length && this.comparator(key, node.entries[i].key) > 0) {
-    i++;
-  }
-
-  // Found it — return the value
-  if (i < node.entries.length && this.comparator(key, node.entries[i].key) === 0) {
-    return node.entries[i].value;
-  }
-
-  // We're at a leaf and didn't find it — it's not in the tree
-  if (node.isLeaf) {
-    return null;
-  }
-
-  // Go into the appropriate child
-  return this.search(node.children[i], key);
+func (tree *BPlusTree[K, V]) findLeaf(key K) *Node[K, V] {
+    node := tree.root
+    for !node.isLeaf {
+        i := len(node.keys) - 1
+        // find the rightmost key <= search key
+        // that determines which child to descend into
+        idx := 0
+        for idx < len(node.keys) && tree.comparator(key, node.keys[idx]) >= 0 {
+            idx++
+        }
+        node = node.children[idx]
+    }
+    return node
 }
 ```
 
-At each node, we scan entries until we find one whose key is `>=` our target. If it equals our target, we return its value. If we reach a leaf without finding it, it doesn't exist. Otherwise, we descend into `children[i]` — the subtree containing keys between `entries[i-1].key` and `entries[i].key`.
+`findLeaf` descends internal nodes: at each node, find the first key strictly greater than the search key — the corresponding child is the subtree that could contain our target. Once we reach a leaf, we scan its keys linearly for an exact match.
 
-The depth of the tree is `O(log n)`. So search is `O(log n)`. For a million entries with `t = 100`, the tree is maybe 3 levels deep. Three node reads. That's why databases love this structure.
+The B+ Tree difference is visible here: every search ends at a leaf. Internal nodes only steer. There's no "found it in an internal node" shortcut like in a plain B-Tree.
+
+---
+
+## Range Queries: Where B+ Trees Shine
+
+This is the operation that justifies the entire B+ Tree design:
+
+```go
+// RangeSearch returns all (key, value) pairs where start <= key <= end.
+func (tree *BPlusTree[K, V]) RangeSearch(start, end K) []Entry[K, V] {
+    var results []Entry[K, V]
+
+    // Find the leaf where `start` would live
+    leaf := tree.findLeaf(start)
+
+    // Walk the leaf linked list until we pass `end`
+    for leaf != nil {
+        for i, k := range leaf.keys {
+            cmp := tree.comparator(k, start)
+            if cmp < 0 {
+                continue // before the range start
+            }
+            if tree.comparator(k, end) > 0 {
+                return results // past the range end
+            }
+            results = append(results, Entry[K, V]{Key: k, Value: leaf.values[i]})
+        }
+        leaf = leaf.next // follow the linked list
+    }
+    return results
+}
+```
+
+Two phases: find the starting leaf with a normal `O(log n)` tree search, then walk the linked list until we've passed `end`. No re-entering the tree. No stack unwinding. Just pointer following.
+
+This is exactly what PostgreSQL does for `WHERE created_at BETWEEN '2024-01-01' AND '2024-01-31'` on a B+ Tree index.
 
 ---
 
 ## Insertion: The Hard Part
 
-Insertion is where B-Trees get interesting. You always insert into a leaf. But leaves can fill up. When a node has `2t - 1` entries (it's full), you can't add more. You need to split it.
+Insertion always targets a leaf. Leaves can fill up. When a node has `2t-1` keys, it's full and must be split before inserting.
 
-**Splitting a node**: Take the middle entry. Push it up to the parent. The left half of the node stays as one child. The right half becomes a new sibling.
+We use the **proactive split** approach: on the way down to the target leaf, split any full nodes we encounter. This means we never need to walk back up the tree.
 
-This is why B-Trees stay balanced. Splits propagate up. If the root splits, a new root is created, and the tree grows taller by exactly one level — uniformly.
+### Splitting Nodes
 
-We'll use the **proactive split** approach: as we walk down to find the insertion point, we split any full nodes we encounter. This means we never need to walk back up.
+Splitting is different for internal nodes and leaf nodes — and this is the most important B+ Tree implementation detail.
 
-### Splitting a Child
+**Splitting a leaf node**: the middle key is **copied** up to the parent (it stays in the leaf AND appears in the parent as a routing key). Both halves of the split leaf remain valid with their data intact.
 
-```typescript
-private splitChild(parent: BTreeNode<K, V>, i: number): void {
-  const t = this.t;
-  const fullChild = parent.children[i];
-  const newNode = new BTreeNode<K, V>(fullChild.isLeaf);
+**Splitting an internal node**: the middle key is **pushed** up to the parent (it leaves the internal node — internal nodes hold no data, so the key has no reason to stay).
 
-  // The middle entry gets promoted to the parent
-  const midEntry = fullChild.entries[t - 1];
+```go
+// splitLeaf splits a full leaf node.
+// The middle key is COPIED to the parent — it stays in the right leaf.
+func (tree *BPlusTree[K, V]) splitLeaf(parent *Node[K, V], i int) {
+    t := tree.t
+    full := parent.children[i]
+    newLeaf := newNode[K, V](true)
 
-  // New node gets the right half of the full child's entries
-  newNode.entries = fullChild.entries.splice(t, t - 1);
+    mid := t - 1 // index of middle key
 
-  // If the full child isn't a leaf, the new node gets the right half of its children too
-  if (!fullChild.isLeaf) {
-    newNode.children = fullChild.children.splice(t, t);
-  }
+    // Right half goes to the new leaf
+    newLeaf.keys = append(newLeaf.keys, full.keys[mid:]...)
+    newLeaf.values = append(newLeaf.values, full.values[mid:]...)
 
-  // Remove the middle entry from the full child (it's going up to the parent)
-  fullChild.entries.splice(t - 1, 1);
+    // Left half stays in the original leaf
+    full.keys = full.keys[:mid]
+    full.values = full.values[:mid]
 
-  // Insert the middle entry into the parent at position i
-  parent.entries.splice(i, 0, midEntry);
+    // Wire up the linked list: full → newLeaf → whatever was after full
+    newLeaf.next = full.next
+    full.next = newLeaf
 
-  // Insert the new node as a child of parent at position i + 1
-  parent.children.splice(i + 1, 0, newNode);
+    // The first key of the new (right) leaf is COPIED up to the parent
+    // It stays in newLeaf AND appears in parent as a routing key
+    parent.keys = append(parent.keys, *new(K))
+    copy(parent.keys[i+1:], parent.keys[i:])
+    parent.keys[i] = newLeaf.keys[0]
+
+    // Insert newLeaf as child i+1 of parent
+    parent.children = append(parent.children, nil)
+    copy(parent.children[i+2:], parent.children[i+1:])
+    parent.children[i+1] = newLeaf
+}
+
+// splitInternal splits a full internal node.
+// The middle key is PUSHED up to the parent — it does NOT stay in either child.
+func (tree *BPlusTree[K, V]) splitInternal(parent *Node[K, V], i int) {
+    t := tree.t
+    full := parent.children[i]
+    newInternal := newNode[K, V](false)
+
+    mid := t - 1 // index of middle key
+
+    // Middle key moves UP to parent (pushed, not copied)
+    midKey := full.keys[mid]
+
+    // Right half of keys goes to new internal node (excluding the middle key)
+    newInternal.keys = append(newInternal.keys, full.keys[mid+1:]...)
+    newInternal.children = append(newInternal.children, full.children[mid+1:]...)
+
+    // Left half stays in original internal node
+    full.keys = full.keys[:mid]
+    full.children = full.children[:mid+1]
+
+    // Middle key is PUSHED up to parent
+    parent.keys = append(parent.keys, *new(K))
+    copy(parent.keys[i+1:], parent.keys[i:])
+    parent.keys[i] = midKey
+
+    // Insert newInternal as child i+1 of parent
+    parent.children = append(parent.children, nil)
+    copy(parent.children[i+2:], parent.children[i+1:])
+    parent.children[i+1] = newInternal
 }
 ```
 
-Before the split, `fullChild` has `2t - 1` entries. After:
-
-- `fullChild` keeps the left `t - 1` entries
-- `midEntry` (with its key and value) goes up to the parent
-- `newNode` gets the right `t - 1` entries
-
-Both children now have `t - 1` entries — the minimum allowed. The parent gained one entry and one child pointer.
+The copy-vs-push distinction is the B+ Tree's defining split behavior. In a plain B-Tree, every split pushes the middle key up. In a B+ Tree, leaf splits copy the middle key (because leaf data must stay complete) while internal splits push the middle key (because internal nodes carry no data anyway).
 
 ### Inserting Into a Non-Full Node
 
-```typescript
-private insertNonFull(node: BTreeNode<K, V>, key: K, value: V): void {
-  let i = node.entries.length - 1;
-
-  if (node.isLeaf) {
-    // Make space and insert the new entry in sorted order
-    node.entries.push({ key, value }); // placeholder at end
-    while (i >= 0 && this.comparator(key, node.entries[i].key) < 0) {
-      node.entries[i + 1] = node.entries[i];
-      i--;
-    }
-    node.entries[i + 1] = { key, value };
-  } else {
-    // Find the right child to recurse into
-    while (i >= 0 && this.comparator(key, node.entries[i].key) < 0) {
-      i--;
-    }
-
-    // If the key already exists in this internal node, update its value in place
-    if (i >= 0 && this.comparator(key, node.entries[i].key) === 0) {
-      node.entries[i].value = value;
-      return;
-    }
-
-    i++;
-
-    // If that child is full, split it first
-    if (node.children[i].entries.length === 2 * this.t - 1) {
-      this.splitChild(node, i);
-
-      // After the split, the middle entry moved up. Which child do we go into?
-      if (this.comparator(key, node.entries[i].key) > 0) {
-        i++;
-      } else if (this.comparator(key, node.entries[i].key) === 0) {
-        // The promoted key is exactly what we're inserting — update it
-        node.entries[i].value = value;
-        return;
-      }
+```go
+func (tree *BPlusTree[K, V]) insertNonFull(node *Node[K, V], key K, value V) {
+    if node.isLeaf {
+        // Insert into the leaf in sorted order
+        i := len(node.keys)
+        node.keys = append(node.keys, *new(K))
+        node.values = append(node.values, *new(V))
+        for i > 0 && tree.comparator(key, node.keys[i-1]) < 0 {
+            node.keys[i] = node.keys[i-1]
+            node.values[i] = node.values[i-1]
+            i--
+        }
+        // If key already exists, update value in place (upsert)
+        if i > 0 && tree.comparator(key, node.keys[i-1]) == 0 {
+            node.keys = node.keys[:len(node.keys)-1]
+            node.values = node.values[:len(node.values)-1]
+            node.values[i-1] = value
+            return
+        }
+        node.keys[i] = key
+        node.values[i] = value
+        return
     }
 
-    this.insertNonFull(node.children[i], key, value);
-  }
+    // Find which child to descend into
+    i := 0
+    for i < len(node.keys) && tree.comparator(key, node.keys[i]) >= 0 {
+        i++
+    }
+
+    // Proactively split the child if it's full
+    if len(node.children[i].keys) == 2*tree.t-1 {
+        if node.children[i].isLeaf {
+            tree.splitLeaf(node, i)
+        } else {
+            tree.splitInternal(node, i)
+        }
+        // After the split, the middle key moved up to node.keys[i].
+        // Determine which child to descend into.
+        if tree.comparator(key, node.keys[i]) >= 0 {
+            i++
+        }
+    }
+
+    tree.insertNonFull(node.children[i], key, value)
 }
 ```
 
-One thing to notice: we handle duplicate keys by updating the value in place. That's map semantics — `insert(key, value)` is also an upsert.
+### The Public Insert
 
-### The Public Insert Method
+```go
+func (tree *BPlusTree[K, V]) Insert(key K, value V) {
+    root := tree.root
 
-```typescript
-insert(key: K, value: V): void {
-  const root = this.root;
+    // Special case: root is full
+    if len(root.keys) == 2*tree.t-1 {
+        newRoot := newNode[K, V](false)
+        newRoot.children = append(newRoot.children, tree.root)
+        tree.root = newRoot
 
-  // If root is full, the tree grows in height
-  if (root.entries.length === 2 * this.t - 1) {
-    const newRoot = new BTreeNode<K, V>(false);
-    newRoot.children.push(this.root);
-    this.root = newRoot;
-    this.splitChild(newRoot, 0);
-    this.insertNonFull(newRoot, key, value);
-  } else {
-    this.insertNonFull(root, key, value);
-  }
+        // Split the old root — use the correct split for its type
+        if root.isLeaf {
+            tree.splitLeaf(newRoot, 0)
+        } else {
+            tree.splitInternal(newRoot, 0)
+        }
+        tree.insertNonFull(newRoot, key, value)
+    } else {
+        tree.insertNonFull(root, key, value)
+    }
 }
 ```
 
-One special case: if the root itself is full, we create a new empty root, make the old root its first child, then split the old root. Now the new root has one entry (the promoted middle entry) and two children. The tree just grew by one level.
-
-This is the only way a B-Tree grows taller. Not by adding depth to one branch — by the root splitting, uniformly.
+If the root is full, we create a new empty root with the old root as its only child, then split the old root. Now the new root has one routing key and two children. The tree grows by one level, uniformly. This is the only way a B+ Tree grows taller.
 
 ---
 
 ## Deletion: The Annoying Part
 
-Deletion is more complex than insertion. When you delete an entry, you might leave a node with too few entries (`< t - 1`). You need to fix that by either borrowing an entry from a sibling or merging with a sibling.
+Deletion in a B+ Tree is slightly different from a plain B-Tree because:
 
-There are three cases:
+1. **Data only exists in leaves** — we always delete from a leaf, never from an internal node.
+2. **Internal nodes may hold copies of deleted keys** — if we delete the smallest key of a leaf, the parent routing key that points to it becomes stale. We may need to update it.
+3. **Underflow handling** — after deletion, if a leaf has fewer than `t-1` keys, borrow from a sibling or merge.
 
-**Case 1**: The key is in a leaf node. Delete it directly.
+### Finding Predecessor and Successor in Leaves
 
-**Case 2**: The key is in an internal node. You can't just remove it — internal entries separate children. Replace it with either its in-order predecessor (largest entry in the left subtree) or in-order successor (smallest entry in the right subtree). Then delete that replacement from the subtree.
-
-**Case 3**: The key isn't in the current node. Find the right child to recurse into. Before recursing, make sure that child has at least `t` entries. If it doesn't, fix it first (borrow from a sibling or merge).
-
-### Finding Predecessor and Successor
-
-```typescript
-private getPredecessor(node: BTreeNode<K, V>, i: number): Entry<K, V> {
-  // Go to left child of entries[i], then go right as far as possible
-  let curr = node.children[i];
-  while (!curr.isLeaf) {
-    curr = curr.children[curr.children.length - 1];
-  }
-  return curr.entries[curr.entries.length - 1];
+```go
+// getLeafPredecessor returns the largest key in the left subtree of children[i].
+func (tree *BPlusTree[K, V]) getLeafPredecessor(node *Node[K, V], i int) K {
+    curr := node.children[i]
+    for !curr.isLeaf {
+        curr = curr.children[len(curr.children)-1]
+    }
+    return curr.keys[len(curr.keys)-1]
 }
 
-private getSuccessor(node: BTreeNode<K, V>, i: number): Entry<K, V> {
-  // Go to right child of entries[i], then go left as far as possible
-  let curr = node.children[i + 1];
-  while (!curr.isLeaf) {
-    curr = curr.children[0];
-  }
-  return curr.entries[0];
+// getLeafSuccessor returns the smallest key in the right subtree of children[i+1].
+func (tree *BPlusTree[K, V]) getLeafSuccessor(node *Node[K, V], i int) K {
+    curr := node.children[i+1]
+    for !curr.isLeaf {
+        curr = curr.children[0]
+    }
+    return curr.keys[0]
 }
 ```
-
-These return the full `Entry<K, V>` — both key and value — because when we replace an internal entry, we need to carry the value along too.
 
 ### Borrowing from Siblings
 
-When a child has too few entries, we try to borrow from an adjacent sibling.
+```go
+func (tree *BPlusTree[K, V]) borrowFromPrevLeaf(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i-1]
 
-```typescript
-private borrowFromPrev(node: BTreeNode<K, V>, i: number): void {
-  const child = node.children[i];
-  const sibling = node.children[i - 1];
+    // Move last entry of sibling to front of child
+    child.keys = append([]K{sibling.keys[len(sibling.keys)-1]}, child.keys...)
+    child.values = append([]V{sibling.values[len(sibling.values)-1]}, child.values...)
 
-  // The parent's entry drops down to the front of child
-  child.entries.unshift(node.entries[i - 1]);
+    sibling.keys = sibling.keys[:len(sibling.keys)-1]
+    sibling.values = sibling.values[:len(sibling.values)-1]
 
-  // If the sibling has children, its last child moves to the front of child's children
-  if (!sibling.isLeaf) {
-    child.children.unshift(sibling.children.pop()!);
-  }
-
-  // The sibling's last entry rises up to replace the parent's entry
-  node.entries[i - 1] = sibling.entries.pop()!;
+    // Update parent routing key — now points to child's new first key
+    parent.keys[i-1] = child.keys[0]
 }
 
-private borrowFromNext(node: BTreeNode<K, V>, i: number): void {
-  const child = node.children[i];
-  const sibling = node.children[i + 1];
+func (tree *BPlusTree[K, V]) borrowFromNextLeaf(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i+1]
 
-  // The parent's entry drops down to the end of child
-  child.entries.push(node.entries[i]);
+    // Move first entry of sibling to end of child
+    child.keys = append(child.keys, sibling.keys[0])
+    child.values = append(child.values, sibling.values[0])
 
-  // If the sibling has children, its first child moves to the end of child's children
-  if (!sibling.isLeaf) {
-    child.children.push(sibling.children.shift()!);
-  }
+    sibling.keys = sibling.keys[1:]
+    sibling.values = sibling.values[1:]
 
-  // The sibling's first entry rises up to replace the parent's entry
-  node.entries[i] = sibling.entries.shift()!;
+    // Update parent routing key — sibling's new first key
+    parent.keys[i] = sibling.keys[0]
+}
+
+func (tree *BPlusTree[K, V]) borrowFromPrevInternal(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i-1]
+
+    // Parent key drops into child, sibling's last key rises to parent
+    child.keys = append([]K{parent.keys[i-1]}, child.keys...)
+    child.children = append([]*Node[K, V]{sibling.children[len(sibling.children)-1]}, child.children...)
+
+    parent.keys[i-1] = sibling.keys[len(sibling.keys)-1]
+
+    sibling.keys = sibling.keys[:len(sibling.keys)-1]
+    sibling.children = sibling.children[:len(sibling.children)-1]
+}
+
+func (tree *BPlusTree[K, V]) borrowFromNextInternal(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i+1]
+
+    // Parent key drops into child, sibling's first key rises to parent
+    child.keys = append(child.keys, parent.keys[i])
+    child.children = append(child.children, sibling.children[0])
+
+    parent.keys[i] = sibling.keys[0]
+
+    sibling.keys = sibling.keys[1:]
+    sibling.children = sibling.children[1:]
 }
 ```
-
-Borrowing is a rotation. The parent entry drops into the child, and the sibling's boundary entry rises up to replace it. Both key and value travel together.
 
 ### Merging Nodes
 
-If neither sibling can lend an entry (both are at the minimum), we merge two children into one.
+```go
+// mergeLeaves merges children[i] and children[i+1] into children[i].
+func (tree *BPlusTree[K, V]) mergeLeaves(parent *Node[K, V], i int) {
+    left := parent.children[i]
+    right := parent.children[i+1]
 
-```typescript
-private merge(node: BTreeNode<K, V>, i: number): void {
-  const leftChild = node.children[i];
-  const rightChild = node.children[i + 1];
+    // Merge right into left
+    left.keys = append(left.keys, right.keys...)
+    left.values = append(left.values, right.values...)
 
-  // Pull the separator entry down from the parent into the left child
-  leftChild.entries.push(node.entries[i]);
+    // Fix linked list: skip over right
+    left.next = right.next
 
-  // Move all entries from right child into left child
-  leftChild.entries.push(...rightChild.entries);
+    // Remove routing key and right child from parent
+    parent.keys = append(parent.keys[:i], parent.keys[i+1:]...)
+    parent.children = append(parent.children[:i+1], parent.children[i+2:]...)
+}
 
-  // Move all children from right child into left child
-  if (!leftChild.isLeaf) {
-    leftChild.children.push(...rightChild.children);
-  }
+// mergeInternals merges children[i] and children[i+1] into children[i].
+// The separator key from parent drops down into the merged node.
+func (tree *BPlusTree[K, V]) mergeInternals(parent *Node[K, V], i int) {
+    left := parent.children[i]
+    right := parent.children[i+1]
 
-  // Remove the separator entry from parent
-  node.entries.splice(i, 1);
+    // Separator key drops from parent into left
+    left.keys = append(left.keys, parent.keys[i])
+    left.keys = append(left.keys, right.keys...)
+    left.children = append(left.children, right.children...)
 
-  // Remove the right child pointer from parent
-  node.children.splice(i + 1, 1);
+    // Remove separator key and right child from parent
+    parent.keys = append(parent.keys[:i], parent.keys[i+1:]...)
+    parent.children = append(parent.children[:i+1], parent.children[i+2:]...)
 }
 ```
 
-After merging, the left child has `(t-1) + 1 + (t-1) = 2t-1` entries — exactly a full node. The parent lost one entry and one child pointer.
+### Fill: Ensuring a Child Has Enough Keys Before Descending
+
+```go
+func (tree *BPlusTree[K, V]) fill(parent *Node[K, V], i int) {
+    t := tree.t
+    child := parent.children[i]
+
+    if i > 0 && len(parent.children[i-1].keys) >= t {
+        if child.isLeaf {
+            tree.borrowFromPrevLeaf(parent, i)
+        } else {
+            tree.borrowFromPrevInternal(parent, i)
+        }
+    } else if i < len(parent.keys) && len(parent.children[i+1].keys) >= t {
+        if child.isLeaf {
+            tree.borrowFromNextLeaf(parent, i)
+        } else {
+            tree.borrowFromNextInternal(parent, i)
+        }
+    } else {
+        // Neither sibling can lend — merge
+        if i < len(parent.keys) {
+            if child.isLeaf {
+                tree.mergeLeaves(parent, i)
+            } else {
+                tree.mergeInternals(parent, i)
+            }
+        } else {
+            if parent.children[i-1].isLeaf {
+                tree.mergeLeaves(parent, i-1)
+            } else {
+                tree.mergeInternals(parent, i-1)
+            }
+        }
+    }
+}
+```
 
 ### The Delete Method
 
-```typescript
-delete(key: K): void {
-  if (!this.root.entries.length) return;
-  this._delete(this.root, key);
+```go
+func (tree *BPlusTree[K, V]) Delete(key K) {
+    if len(tree.root.keys) == 0 {
+        return
+    }
+    tree.delete(tree.root, key)
 
-  // If root is now empty (after a merge), its only child becomes the new root
-  if (this.root.entries.length === 0 && !this.root.isLeaf) {
-    this.root = this.root.children[0];
-  }
+    // If root is now empty and has children, shrink the tree
+    if len(tree.root.keys) == 0 && !tree.root.isLeaf {
+        tree.root = tree.root.children[0]
+    }
 }
 
-private _delete(node: BTreeNode<K, V>, key: K): void {
-  const t = this.t;
-  let i = node.entries.findIndex(e => this.comparator(key, e.key) <= 0);
-  if (i === -1) i = node.entries.length;
+func (tree *BPlusTree[K, V]) delete(node *Node[K, V], key K) {
+    t := tree.t
 
-  if (i < node.entries.length && this.comparator(key, node.entries[i].key) === 0) {
-    // Key is in this node
-    if (node.isLeaf) {
-      // Case 1: leaf — just remove it
-      node.entries.splice(i, 1);
-    } else {
-      // Case 2: internal node
-      if (node.children[i].entries.length >= t) {
-        // Left child has enough entries — replace with predecessor
-        const pred = this.getPredecessor(node, i);
-        node.entries[i] = pred;
-        this._delete(node.children[i], pred.key);
-      } else if (node.children[i + 1].entries.length >= t) {
-        // Right child has enough entries — replace with successor
-        const succ = this.getSuccessor(node, i);
-        node.entries[i] = succ;
-        this._delete(node.children[i + 1], succ.key);
-      } else {
-        // Both children have minimum entries — merge and delete from merged node
-        this.merge(node, i);
-        this._delete(node.children[i], key);
-      }
-    }
-  } else {
-    // Case 3: key is not in this node, go into the appropriate child
-    if (node.isLeaf) return; // key doesn't exist
-
-    const isLastChild = i === node.entries.length;
-
-    // Make sure the child we're going into has at least t entries
-    if (node.children[i].entries.length < t) {
-      this.fill(node, i);
-      if (isLastChild && i > node.entries.length) i--;
+    if node.isLeaf {
+        // Find and remove the key from the leaf
+        for i, k := range node.keys {
+            if tree.comparator(key, k) == 0 {
+                node.keys = append(node.keys[:i], node.keys[i+1:]...)
+                node.values = append(node.values[:i], node.values[i+1:]...)
+                return
+            }
+        }
+        return // key not found
     }
 
-    this._delete(node.children[i], key);
-  }
-}
+    // Find which child subtree might contain the key
+    i := 0
+    for i < len(node.keys) && tree.comparator(key, node.keys[i]) >= 0 {
+        i++
+    }
 
-private fill(node: BTreeNode<K, V>, i: number): void {
-  if (i > 0 && node.children[i - 1].entries.length >= this.t) {
-    this.borrowFromPrev(node, i);
-  } else if (i < node.entries.length && node.children[i + 1].entries.length >= this.t) {
-    this.borrowFromNext(node, i);
-  } else {
-    if (i < node.entries.length) this.merge(node, i);
-    else this.merge(node, i - 1);
-  }
+    isLastChild := i == len(node.keys)
+
+    // Ensure the child we're descending into has enough keys
+    if len(node.children[i].keys) < t {
+        tree.fill(node, i)
+        // After fill, indices may have shifted due to merge
+        if isLastChild && i > len(node.keys) {
+            i--
+        }
+    }
+
+    tree.delete(node.children[i], key)
+
+    // After deletion, update stale routing keys in internal nodes.
+    // If we deleted the minimum key of a subtree, the routing key
+    // pointing to that subtree may now be stale.
+    if !node.isLeaf && i < len(node.keys) {
+        node.keys[i] = tree.getLeafSuccessor(node, i)
+    }
 }
 ```
+
+The routing key update at the end is the B+ Tree detail that plain B-Tree implementations don't need. Because internal keys in a B+ Tree are copies of leaf keys (not the actual data), deleting from a leaf can leave a stale routing key in a parent. We refresh it after every descent.
 
 ---
 
 ## Putting It All Together
 
-Here's the complete implementation:
+Here is the complete implementation:
 
-```typescript
-type Comparator<K> = (a: K, b: K) => number;
+```go
+package bplustree
 
-interface Entry<K, V> {
-  key: K;
-  value: V;
+import "strings"
+
+// Comparator defines key ordering. Return negative if a < b, zero if a == b, positive if a > b.
+type Comparator[K any] func(a, b K) int
+
+type Entry[K any, V any] struct {
+    Key   K
+    Value V
 }
 
-class BTreeNode<K, V> {
-  entries: Entry<K, V>[];
-  children: BTreeNode<K, V>[];
-  isLeaf: boolean;
-
-  constructor(isLeaf: boolean) {
-    this.entries = [];
-    this.children = [];
-    this.isLeaf = isLeaf;
-  }
+type Node[K any, V any] struct {
+    keys     []K
+    values   []V
+    children []*Node[K, V]
+    next     *Node[K, V]
+    isLeaf   bool
 }
 
-class BTree<K, V> {
-  root: BTreeNode<K, V>;
-  t: number;
-  comparator: Comparator<K>;
+func newNode[K any, V any](isLeaf bool) *Node[K, V] {
+    return &Node[K, V]{isLeaf: isLeaf}
+}
 
-  constructor(t: number, comparator: Comparator<K>) {
-    this.t = t;
-    this.comparator = comparator;
-    this.root = new BTreeNode<K, V>(true);
-  }
+type BPlusTree[K any, V any] struct {
+    root       *Node[K, V]
+    t          int
+    comparator Comparator[K]
+}
 
-  search(node: BTreeNode<K, V>, key: K): V | null {
-    let i = 0;
-    while (i < node.entries.length && this.comparator(key, node.entries[i].key) > 0) i++;
-    if (i < node.entries.length && this.comparator(key, node.entries[i].key) === 0) {
-      return node.entries[i].value;
+func NewBPlusTree[K any, V any](t int, cmp Comparator[K]) *BPlusTree[K, V] {
+    return &BPlusTree[K, V]{
+        root:       newNode[K, V](true),
+        t:          t,
+        comparator: cmp,
     }
-    if (node.isLeaf) return null;
-    return this.search(node.children[i], key);
-  }
+}
 
-  private splitChild(parent: BTreeNode<K, V>, i: number): void {
-    const t = this.t;
-    const fullChild = parent.children[i];
-    const newNode = new BTreeNode<K, V>(fullChild.isLeaf);
-    const midEntry = fullChild.entries[t - 1];
-    newNode.entries = fullChild.entries.splice(t, t - 1);
-    if (!fullChild.isLeaf) newNode.children = fullChild.children.splice(t, t);
-    fullChild.entries.splice(t - 1, 1);
-    parent.entries.splice(i, 0, midEntry);
-    parent.children.splice(i + 1, 0, newNode);
-  }
-
-  private insertNonFull(node: BTreeNode<K, V>, key: K, value: V): void {
-    let i = node.entries.length - 1;
-    if (node.isLeaf) {
-      node.entries.push({ key, value });
-      while (i >= 0 && this.comparator(key, node.entries[i].key) < 0) {
-        node.entries[i + 1] = node.entries[i];
-        i--;
-      }
-      node.entries[i + 1] = { key, value };
-    } else {
-      while (i >= 0 && this.comparator(key, node.entries[i].key) < 0) i--;
-      if (i >= 0 && this.comparator(key, node.entries[i].key) === 0) {
-        node.entries[i].value = value;
-        return;
-      }
-      i++;
-      if (node.children[i].entries.length === 2 * this.t - 1) {
-        this.splitChild(node, i);
-        if (this.comparator(key, node.entries[i].key) > 0) i++;
-        else if (this.comparator(key, node.entries[i].key) === 0) {
-          node.entries[i].value = value;
-          return;
+func (tree *BPlusTree[K, V]) findLeaf(key K) *Node[K, V] {
+    node := tree.root
+    for !node.isLeaf {
+        i := 0
+        for i < len(node.keys) && tree.comparator(key, node.keys[i]) >= 0 {
+            i++
         }
-      }
-      this.insertNonFull(node.children[i], key, value);
+        node = node.children[i]
     }
-  }
+    return node
+}
 
-  insert(key: K, value: V): void {
-    const root = this.root;
-    if (root.entries.length === 2 * this.t - 1) {
-      const newRoot = new BTreeNode<K, V>(false);
-      newRoot.children.push(this.root);
-      this.root = newRoot;
-      this.splitChild(newRoot, 0);
-      this.insertNonFull(newRoot, key, value);
-    } else {
-      this.insertNonFull(root, key, value);
+func (tree *BPlusTree[K, V]) Search(key K) (V, bool) {
+    leaf := tree.findLeaf(key)
+    for i, k := range leaf.keys {
+        cmp := tree.comparator(key, k)
+        if cmp == 0 {
+            return leaf.values[i], true
+        }
+        if cmp < 0 {
+            break
+        }
     }
-  }
+    var zero V
+    return zero, false
+}
 
-  private getPredecessor(node: BTreeNode<K, V>, i: number): Entry<K, V> {
-    let curr = node.children[i];
-    while (!curr.isLeaf) curr = curr.children[curr.children.length - 1];
-    return curr.entries[curr.entries.length - 1];
-  }
-
-  private getSuccessor(node: BTreeNode<K, V>, i: number): Entry<K, V> {
-    let curr = node.children[i + 1];
-    while (!curr.isLeaf) curr = curr.children[0];
-    return curr.entries[0];
-  }
-
-  private borrowFromPrev(node: BTreeNode<K, V>, i: number): void {
-    const child = node.children[i];
-    const sibling = node.children[i - 1];
-    child.entries.unshift(node.entries[i - 1]);
-    if (!sibling.isLeaf) child.children.unshift(sibling.children.pop()!);
-    node.entries[i - 1] = sibling.entries.pop()!;
-  }
-
-  private borrowFromNext(node: BTreeNode<K, V>, i: number): void {
-    const child = node.children[i];
-    const sibling = node.children[i + 1];
-    child.entries.push(node.entries[i]);
-    if (!sibling.isLeaf) child.children.push(sibling.children.shift()!);
-    node.entries[i] = sibling.entries.shift()!;
-  }
-
-  private merge(node: BTreeNode<K, V>, i: number): void {
-    const leftChild = node.children[i];
-    const rightChild = node.children[i + 1];
-    leftChild.entries.push(node.entries[i]);
-    leftChild.entries.push(...rightChild.entries);
-    if (!leftChild.isLeaf) leftChild.children.push(...rightChild.children);
-    node.entries.splice(i, 1);
-    node.children.splice(i + 1, 1);
-  }
-
-  private fill(node: BTreeNode<K, V>, i: number): void {
-    if (i > 0 && node.children[i - 1].entries.length >= this.t) {
-      this.borrowFromPrev(node, i);
-    } else if (i < node.entries.length && node.children[i + 1].entries.length >= this.t) {
-      this.borrowFromNext(node, i);
-    } else {
-      if (i < node.entries.length) this.merge(node, i);
-      else this.merge(node, i - 1);
+func (tree *BPlusTree[K, V]) RangeSearch(start, end K) []Entry[K, V] {
+    var results []Entry[K, V]
+    leaf := tree.findLeaf(start)
+    for leaf != nil {
+        for i, k := range leaf.keys {
+            if tree.comparator(k, start) < 0 {
+                continue
+            }
+            if tree.comparator(k, end) > 0 {
+                return results
+            }
+            results = append(results, Entry[K, V]{Key: k, Value: leaf.values[i]})
+        }
+        leaf = leaf.next
     }
-  }
+    return results
+}
 
-  private _delete(node: BTreeNode<K, V>, key: K): void {
-    const t = this.t;
-    let i = node.entries.findIndex((e) => this.comparator(key, e.key) <= 0);
-    if (i === -1) i = node.entries.length;
+func (tree *BPlusTree[K, V]) splitLeaf(parent *Node[K, V], i int) {
+    t := tree.t
+    full := parent.children[i]
+    newLeaf := newNode[K, V](true)
+    mid := t - 1
 
-    if (i < node.entries.length && this.comparator(key, node.entries[i].key) === 0) {
-      if (node.isLeaf) {
-        node.entries.splice(i, 1);
-      } else {
-        if (node.children[i].entries.length >= t) {
-          const pred = this.getPredecessor(node, i);
-          node.entries[i] = pred;
-          this._delete(node.children[i], pred.key);
-        } else if (node.children[i + 1].entries.length >= t) {
-          const succ = this.getSuccessor(node, i);
-          node.entries[i] = succ;
-          this._delete(node.children[i + 1], succ.key);
+    newLeaf.keys = append(newLeaf.keys, full.keys[mid:]...)
+    newLeaf.values = append(newLeaf.values, full.values[mid:]...)
+    full.keys = full.keys[:mid]
+    full.values = full.values[:mid]
+
+    newLeaf.next = full.next
+    full.next = newLeaf
+
+    parent.keys = append(parent.keys, *new(K))
+    copy(parent.keys[i+1:], parent.keys[i:])
+    parent.keys[i] = newLeaf.keys[0]
+
+    parent.children = append(parent.children, nil)
+    copy(parent.children[i+2:], parent.children[i+1:])
+    parent.children[i+1] = newLeaf
+}
+
+func (tree *BPlusTree[K, V]) splitInternal(parent *Node[K, V], i int) {
+    t := tree.t
+    full := parent.children[i]
+    newInternal := newNode[K, V](false)
+    mid := t - 1
+
+    midKey := full.keys[mid]
+    newInternal.keys = append(newInternal.keys, full.keys[mid+1:]...)
+    newInternal.children = append(newInternal.children, full.children[mid+1:]...)
+    full.keys = full.keys[:mid]
+    full.children = full.children[:mid+1]
+
+    parent.keys = append(parent.keys, *new(K))
+    copy(parent.keys[i+1:], parent.keys[i:])
+    parent.keys[i] = midKey
+
+    parent.children = append(parent.children, nil)
+    copy(parent.children[i+2:], parent.children[i+1:])
+    parent.children[i+1] = newInternal
+}
+
+func (tree *BPlusTree[K, V]) insertNonFull(node *Node[K, V], key K, value V) {
+    if node.isLeaf {
+        i := len(node.keys)
+        node.keys = append(node.keys, *new(K))
+        node.values = append(node.values, *new(V))
+        for i > 0 && tree.comparator(key, node.keys[i-1]) < 0 {
+            node.keys[i] = node.keys[i-1]
+            node.values[i] = node.values[i-1]
+            i--
+        }
+        if i > 0 && tree.comparator(key, node.keys[i-1]) == 0 {
+            node.keys = node.keys[:len(node.keys)-1]
+            node.values = node.values[:len(node.values)-1]
+            node.values[i-1] = value
+            return
+        }
+        node.keys[i] = key
+        node.values[i] = value
+        return
+    }
+
+    i := 0
+    for i < len(node.keys) && tree.comparator(key, node.keys[i]) >= 0 {
+        i++
+    }
+
+    if len(node.children[i].keys) == 2*tree.t-1 {
+        if node.children[i].isLeaf {
+            tree.splitLeaf(node, i)
         } else {
-          this.merge(node, i);
-          this._delete(node.children[i], key);
+            tree.splitInternal(node, i)
         }
-      }
+        if tree.comparator(key, node.keys[i]) >= 0 {
+            i++
+        }
+    }
+
+    tree.insertNonFull(node.children[i], key, value)
+}
+
+func (tree *BPlusTree[K, V]) Insert(key K, value V) {
+    root := tree.root
+    if len(root.keys) == 2*tree.t-1 {
+        newRoot := newNode[K, V](false)
+        newRoot.children = append(newRoot.children, tree.root)
+        tree.root = newRoot
+        if root.isLeaf {
+            tree.splitLeaf(newRoot, 0)
+        } else {
+            tree.splitInternal(newRoot, 0)
+        }
+        tree.insertNonFull(newRoot, key, value)
     } else {
-      if (node.isLeaf) return;
-      const isLastChild = i === node.entries.length;
-      if (node.children[i].entries.length < t) {
-        this.fill(node, i);
-        if (isLastChild && i > node.entries.length) i--;
-      }
-      this._delete(node.children[i], key);
+        tree.insertNonFull(root, key, value)
     }
-  }
+}
 
-  delete(key: K): void {
-    if (!this.root.entries.length) return;
-    this._delete(this.root, key);
-    if (this.root.entries.length === 0 && !this.root.isLeaf) {
-      this.root = this.root.children[0];
+func (tree *BPlusTree[K, V]) getLeafSuccessor(node *Node[K, V], i int) K {
+    curr := node.children[i+1]
+    for !curr.isLeaf {
+        curr = curr.children[0]
     }
-  }
+    return curr.keys[0]
+}
 
-  traverse(node: BTreeNode<K, V> = this.root, depth = 0): void {
-    const label = node.entries.map((e) => `${e.key}:${e.value}`).join(", ");
-    console.log(" ".repeat(depth * 2) + "[" + label + "]");
-    for (const child of node.children) {
-      this.traverse(child, depth + 1);
+func (tree *BPlusTree[K, V]) borrowFromPrevLeaf(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i-1]
+    child.keys = append([]K{sibling.keys[len(sibling.keys)-1]}, child.keys...)
+    child.values = append([]V{sibling.values[len(sibling.values)-1]}, child.values...)
+    sibling.keys = sibling.keys[:len(sibling.keys)-1]
+    sibling.values = sibling.values[:len(sibling.values)-1]
+    parent.keys[i-1] = child.keys[0]
+}
+
+func (tree *BPlusTree[K, V]) borrowFromNextLeaf(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i+1]
+    child.keys = append(child.keys, sibling.keys[0])
+    child.values = append(child.values, sibling.values[0])
+    sibling.keys = sibling.keys[1:]
+    sibling.values = sibling.values[1:]
+    parent.keys[i] = sibling.keys[0]
+}
+
+func (tree *BPlusTree[K, V]) borrowFromPrevInternal(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i-1]
+    child.keys = append([]K{parent.keys[i-1]}, child.keys...)
+    child.children = append([]*Node[K, V]{sibling.children[len(sibling.children)-1]}, child.children...)
+    parent.keys[i-1] = sibling.keys[len(sibling.keys)-1]
+    sibling.keys = sibling.keys[:len(sibling.keys)-1]
+    sibling.children = sibling.children[:len(sibling.children)-1]
+}
+
+func (tree *BPlusTree[K, V]) borrowFromNextInternal(parent *Node[K, V], i int) {
+    child := parent.children[i]
+    sibling := parent.children[i+1]
+    child.keys = append(child.keys, parent.keys[i])
+    child.children = append(child.children, sibling.children[0])
+    parent.keys[i] = sibling.keys[0]
+    sibling.keys = sibling.keys[1:]
+    sibling.children = sibling.children[1:]
+}
+
+func (tree *BPlusTree[K, V]) mergeLeaves(parent *Node[K, V], i int) {
+    left := parent.children[i]
+    right := parent.children[i+1]
+    left.keys = append(left.keys, right.keys...)
+    left.values = append(left.values, right.values...)
+    left.next = right.next
+    parent.keys = append(parent.keys[:i], parent.keys[i+1:]...)
+    parent.children = append(parent.children[:i+1], parent.children[i+2:]...)
+}
+
+func (tree *BPlusTree[K, V]) mergeInternals(parent *Node[K, V], i int) {
+    left := parent.children[i]
+    right := parent.children[i+1]
+    left.keys = append(left.keys, parent.keys[i])
+    left.keys = append(left.keys, right.keys...)
+    left.children = append(left.children, right.children...)
+    parent.keys = append(parent.keys[:i], parent.keys[i+1:]...)
+    parent.children = append(parent.children[:i+1], parent.children[i+2:]...)
+}
+
+func (tree *BPlusTree[K, V]) fill(parent *Node[K, V], i int) {
+    t := tree.t
+    child := parent.children[i]
+    if i > 0 && len(parent.children[i-1].keys) >= t {
+        if child.isLeaf {
+            tree.borrowFromPrevLeaf(parent, i)
+        } else {
+            tree.borrowFromPrevInternal(parent, i)
+        }
+    } else if i < len(parent.keys) && len(parent.children[i+1].keys) >= t {
+        if child.isLeaf {
+            tree.borrowFromNextLeaf(parent, i)
+        } else {
+            tree.borrowFromNextInternal(parent, i)
+        }
+    } else {
+        if i < len(parent.keys) {
+            if child.isLeaf {
+                tree.mergeLeaves(parent, i)
+            } else {
+                tree.mergeInternals(parent, i)
+            }
+        } else {
+            if parent.children[i-1].isLeaf {
+                tree.mergeLeaves(parent, i-1)
+            } else {
+                tree.mergeInternals(parent, i-1)
+            }
+        }
     }
-  }
+}
+
+func (tree *BPlusTree[K, V]) delete(node *Node[K, V], key K) {
+    t := tree.t
+    if node.isLeaf {
+        for i, k := range node.keys {
+            if tree.comparator(key, k) == 0 {
+                node.keys = append(node.keys[:i], node.keys[i+1:]...)
+                node.values = append(node.values[:i], node.values[i+1:]...)
+                return
+            }
+        }
+        return
+    }
+
+    i := 0
+    for i < len(node.keys) && tree.comparator(key, node.keys[i]) >= 0 {
+        i++
+    }
+
+    isLastChild := i == len(node.keys)
+    if len(node.children[i].keys) < t {
+        tree.fill(node, i)
+        if isLastChild && i > len(node.keys) {
+            i--
+        }
+    }
+
+    tree.delete(node.children[i], key)
+
+    if !node.isLeaf && i < len(node.keys) {
+        node.keys[i] = tree.getLeafSuccessor(node, i)
+    }
+}
+
+func (tree *BPlusTree[K, V]) Delete(key K) {
+    if len(tree.root.keys) == 0 {
+        return
+    }
+    tree.delete(tree.root, key)
+    if len(tree.root.keys) == 0 && !tree.root.isLeaf {
+        tree.root = tree.root.children[0]
+    }
+}
+
+// Traverse prints the tree level by level for debugging.
+func (tree *BPlusTree[K, V]) Traverse() {
+    if tree.root == nil {
+        return
+    }
+    queue := []*Node[K, V]{tree.root}
+    for len(queue) > 0 {
+        next := []*Node[K, V]{}
+        for _, node := range queue {
+            if node.isLeaf {
+                print("[leaf:")
+                for i, k := range node.keys {
+                    if i > 0 {
+                        print(" ")
+                    }
+                    print(k, ":", node.values[i])
+                }
+                print("] ")
+            } else {
+                print("[internal:")
+                for i, k := range node.keys {
+                    if i > 0 {
+                        print(" ")
+                    }
+                    print(k)
+                }
+                print("] ")
+                next = append(next, node.children...)
+            }
+        }
+        println()
+        queue = next
+    }
 }
 ```
 
-Run it with a numeric key and a string value — like a simple user ID to username map:
+Run it:
 
-```typescript
-const tree = new BTree<number, string>(3, (a, b) => a - b);
+```go
+func main() {
+    // Integer keys, string values — like a user ID → username index
+    tree := NewBPlusTree[int, string](3, func(a, b int) int { return a - b })
 
-tree.insert(10, "alice");
-tree.insert(20, "bob");
-tree.insert(5, "carol");
-tree.insert(6, "dave");
-tree.insert(12, "eve");
-tree.insert(30, "frank");
-tree.insert(7, "grace");
-tree.insert(17, "heidi");
+    tree.Insert(10, "alice")
+    tree.Insert(20, "bob")
+    tree.Insert(5,  "carol")
+    tree.Insert(6,  "dave")
+    tree.Insert(12, "eve")
+    tree.Insert(30, "frank")
+    tree.Insert(7,  "grace")
+    tree.Insert(17, "heidi")
 
-tree.traverse();
-// [10:alice, 20:bob]
-//   [5:carol, 6:dave, 7:grace]
-//   [12:eve, 17:heidi]
-//   [30:frank]
+    tree.Traverse()
+    // [internal:7 17]
+    //   [leaf:5:carol 6:dave] [leaf:7:grace 10:alice 12:eve] [leaf:17:heidi 20:bob 30:frank]
+    //   (leaves are linked: 5,6 → 7,10,12 → 17,20,30 → nil)
 
-console.log(tree.search(tree.root, 17)); // "heidi"
-console.log(tree.search(tree.root, 99)); // null
+    v, ok := tree.Search(17)
+    fmt.Println(v, ok) // heidi true
 
-// Upsert — update an existing key's value
-tree.insert(17, "hannah");
-console.log(tree.search(tree.root, 17)); // "hannah"
+    v, ok = tree.Search(99)
+    fmt.Println(v, ok) // "" false
 
-tree.delete(6);
-tree.delete(20);
-tree.traverse();
+    // Range query — the B+ Tree's killer feature
+    results := tree.RangeSearch(6, 17)
+    for _, e := range results {
+        fmt.Printf("%d:%s ", e.Key, e.Value)
+    }
+    // 6:dave 7:grace 10:alice 12:eve 17:heidi
+
+    // Upsert — update an existing key
+    tree.Insert(17, "hannah")
+    v, _ = tree.Search(17)
+    fmt.Println(v) // hannah
+
+    tree.Delete(6)
+    tree.Delete(20)
+    tree.Traverse()
+
+    // String keys — just change the comparator
+    strTree := NewBPlusTree[string, int](3, strings.Compare)
+    strTree.Insert("apple", 1)
+    strTree.Insert("banana", 2)
+    strTree.Insert("cherry", 3)
+    v2, _ := strTree.Search("banana")
+    fmt.Println(v2) // 2
+}
 ```
-
-Or with string keys:
-
-```typescript
-const index = new BTree<string, number>(3, (a, b) => a.localeCompare(b));
-
-index.insert("apple", 1);
-index.insert("banana", 2);
-index.insert("cherry", 3);
-
-console.log(index.search(index.root, "banana")); // 2
-```
-
-The comparator is the only thing that changes. The rest of the tree doesn't care what type the keys are.
 
 ---
 
 ## What You Actually Have
 
-A generic `BTree<K, V>` that works with any key type, maps keys to values, and handles upserts. Every node holds between `t-1` and `2t-1` entries. Every leaf sits at the same depth. Every search, insert, and delete runs in `O(log n)`.
+A generic `BPlusTree[K, V]` in Go with any comparable key type, map semantics (upserts), and the linked leaf list that makes range queries efficient.
 
-The invariants that make this work:
+The key differences from a plain B-Tree:
 
-- Every non-root node has between `t-1` and `2t-1` entries. No node is too empty or too full.
-- Every internal node with `n` entries has exactly `n+1` children. The tree is always navigable.
-- All leaves are at the same depth. Search time is perfectly predictable.
+- **Splits behave differently for leaves vs internal nodes.** Leaf splits copy the middle key up. Internal splits push it up. Getting this wrong produces a tree that loses data.
+- **Range queries use the leaf linked list.** One `O(log n)` search to find the start, then `O(k)` linked-list traversal for `k` results. No tree re-entry.
+- **Routing key updates on deletion.** After deleting from a leaf, stale routing keys in parent internal nodes need refreshing. A plain B-Tree doesn't need this because internal nodes carry the actual data.
 
-Insertions split nodes on the way down. Deletions borrow or merge on the way down. Neither operation ever needs a second pass back up the tree.
+The invariants that keep the tree correct:
 
-That's it. It's not magic. It's just a tree that keeps itself balanced by carefully controlling how nodes grow and shrink — and now it actually stores your data.
+- Every non-root node has between `t-1` and `2t-1` keys. No node is too empty or too full.
+- Every internal node with `n` keys has exactly `n+1` children.
+- All leaves are at the same depth. Every search takes the same number of steps.
+- Every leaf is reachable via the linked list. Range queries are complete.
+
+That's it. It's not magic. It's just a sorted tree that stores its data at the bottom and threads its leaves together — which happens to be exactly what every database index does.
