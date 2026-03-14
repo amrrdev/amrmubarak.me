@@ -168,110 +168,244 @@ The `WHERE version = 7` is the entire conflict detection mechanism. If another t
 
 ## Locks: Shared, Exclusive, Row-Level, Table-Level
 
-PostgreSQL has a rich locking system with multiple lock types at multiple granularities.
+A lock is how one transaction tells other transactions: "I am using this — wait or stay away." PostgreSQL has locks at two levels: row-level (targeting individual rows) and table-level (targeting the whole table). Understanding both tells you exactly what blocks what, and why.
 
-### Lock Modes
+### The Two Fundamental Lock Types
 
-**Shared Lock (S)**: multiple transactions can hold shared locks on the same resource simultaneously. Used when you want to read something and prevent concurrent writes, but allow other readers.
+Every lock is either shared or exclusive.
 
-**Exclusive Lock (X)**: only one transaction can hold an exclusive lock. Incompatible with all other locks — both shared and exclusive. Any `UPDATE`, `DELETE`, or `SELECT FOR UPDATE` acquires an exclusive row lock.
+A **shared lock** lets multiple transactions hold it simultaneously. It says "I am reading this — others can read too, but nobody can change it while I am here."
+
+An **exclusive lock** allows only one holder at a time. It says "I own this — nobody else can read or write until I am done."
 
 ```
-Lock compatibility:
+Two readers: both take shared locks → compatible, both proceed
+One writer:  takes exclusive lock   → incompatible with everyone, all others wait
 
-              Shared    Exclusive
-Shared          ✓           ✗
-Exclusive       ✗           ✗
+Reader + Writer at the same time:
+  Reader holds shared lock
+  Writer wants exclusive lock → BLOCKED until reader releases
 ```
 
-Two readers never block each other. Any writer blocks all other readers and writers on the same row.
+This is the fundamental tension: readers and writers want the same row at the same time. Pure locking forces one to wait. MVCC (covered later) solves this by giving each reader their own snapshot — but that is a separate mechanism. When you use explicit locks, the compatibility rules above always apply.
 
-### Row-Level Locks
+### Row-Level Locks: Four Modes, Not Two
 
-Row-level locks target individual rows, allowing concurrent access to different rows in the same table. PostgreSQL has four row-level lock modes from strongest to weakest:
+PostgreSQL has four row-level lock modes, not just "shared" and "exclusive." The reason is that not all writes are equal. Deleting a row is more disruptive than updating a non-key column. Foreign key checks need a lighter guarantee than full ownership of a row. The four modes let you express exactly how much protection you need.
 
-**FOR UPDATE** — the strongest. Locks the row exclusively. Blocks any other `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, or `FOR KEY SHARE`. Use this when you are about to modify or delete the row.
+Here they are from weakest to strongest, with the scenarios that require each one.
 
-**FOR NO KEY UPDATE** — like `FOR UPDATE` but does not block `FOR KEY SHARE`. Used when updating non-key columns, avoids blocking foreign key checks from child tables.
+---
 
-**FOR SHARE** — shared lock. Blocks `FOR UPDATE` and `FOR NO KEY UPDATE` but allows other `FOR SHARE` and `FOR KEY SHARE`. Use when you need to read a row and prevent updates but allow other readers.
+**FOR KEY SHARE — "I need this row to stay identifiable"**
 
-**FOR KEY SHARE** — the weakest. Only blocks `FOR UPDATE`. Used by foreign key checks — prevents the referenced row from being deleted while the check is in progress.
+The lightest lock. It only prevents the row from being deleted or having its primary key changed. Everything else — including other transactions updating non-key columns — can proceed.
+
+PostgreSQL acquires this automatically when checking a foreign key. If you insert a row into `orders` that references `users.id = 42`, PostgreSQL takes a `FOR KEY SHARE` lock on user 42 to ensure it is not deleted while the foreign key check is running. It does not prevent someone from updating user 42's name or email — only deletion or key changes matter for referential integrity.
+
+```
+Scenario: concurrent foreign key check + profile update
+
+Step 1: Tx A (INSERT into orders referencing user 42)
+        → takes FOR KEY SHARE on users WHERE id=42
+
+Step 2: Tx B (UPDATE users SET email='new@x.com' WHERE id=42)
+        → FOR KEY SHARE does NOT block this → Tx B proceeds ✓
+
+Step 3: Tx C (DELETE FROM users WHERE id=42)
+        → FOR KEY SHARE blocks this → Tx C waits ✗
+```
+
+---
+
+**FOR SHARE — "I need this row to not change while I make a decision"**
+
+Stronger than `FOR KEY SHARE`. It prevents any modification to the row — key or non-key columns — but allows other transactions to also take shared locks. Multiple readers can hold `FOR SHARE` simultaneously.
+
+Use this when you read a row, make a business decision based on it, and need to guarantee the row has not changed before you act. The classic example: you read an account balance, run some validation logic, and then write a dependent record. You want the balance frozen for the duration.
+
+```
+Scenario: two transactions reading the same row for decisions
+
+Step 1: Tx A → SELECT * FROM accounts WHERE id=1 FOR SHARE
+        → takes FOR SHARE lock ✓
+
+Step 2: Tx B → SELECT * FROM accounts WHERE id=1 FOR SHARE
+        → FOR SHARE is compatible with FOR SHARE → Tx B proceeds ✓
+        Both readers hold the lock simultaneously
+
+Step 3: Tx C → UPDATE accounts SET balance=999 WHERE id=1
+        → UPDATE requires FOR NO KEY UPDATE or stronger
+        → FOR SHARE blocks this → Tx C waits ✗
+
+Step 4: Tx A and Tx B commit → Tx C proceeds ✓
+```
+
+---
+
+**FOR NO KEY UPDATE — "I am updating this row but not its key"**
+
+Strong enough to prevent other writers, but explicitly signals that the primary key is not changing. This matters for foreign key checks: if you hold `FOR NO KEY UPDATE`, a transaction doing a foreign key check on this row (which takes `FOR KEY SHARE`) can still proceed, because the key is guaranteed to stay the same.
+
+PostgreSQL acquires this automatically for `UPDATE` statements that do not touch primary key columns. You rarely need to use it explicitly — it is more of an internal implementation detail that becomes relevant when you are diagnosing why a certain `UPDATE` is or is not blocking a foreign key check.
+
+```
+Scenario: updating a non-key column while a child table is inserting
+
+Step 1: Tx A → UPDATE users SET email='x@x.com' WHERE id=42
+        → takes FOR NO KEY UPDATE (key columns unchanged)
+
+Step 2: Tx B → INSERT INTO orders (user_id=42, ...)
+        → foreign key check takes FOR KEY SHARE on users WHERE id=42
+        → FOR KEY SHARE is compatible with FOR NO KEY UPDATE → Tx B proceeds ✓
+
+If Tx A had taken FOR UPDATE instead:
+Step 2: Tx B → FOR KEY SHARE blocked by FOR UPDATE → Tx B waits ✗
+```
+
+This is why PostgreSQL uses `FOR NO KEY UPDATE` internally instead of always upgrading to `FOR UPDATE`. It avoids unnecessarily blocking child table inserts when only non-key columns are changing.
+
+---
+
+**FOR UPDATE — "I own this row completely"**
+
+The strongest row lock. Blocks everything: other `FOR UPDATE`, `FOR NO KEY UPDATE`, `FOR SHARE`, and `FOR KEY SHARE`. No other transaction can read-with-lock or write this row until you release it.
+
+Use this whenever you intend to update or delete the row — or when you are making a critical decision (like a payment or a seat booking) where you absolutely cannot allow any concurrent access.
+
+```
+Scenario: two transactions trying to book the last seat
+
+Step 1: Tx A → SELECT * FROM seats WHERE id=99 AND available=true FOR UPDATE
+        → takes FOR UPDATE on seat 99 ✓
+
+Step 2: Tx B → SELECT * FROM seats WHERE id=99 AND available=true FOR UPDATE
+        → FOR UPDATE conflicts with FOR UPDATE → Tx B BLOCKS
+
+Step 3: Tx A → UPDATE seats SET available=false WHERE id=99
+Step 4: Tx A → COMMIT → releases lock
+
+Step 5: Tx B → unblocked, runs its SELECT
+        → returns 0 rows (available=false now)
+        → Tx B knows the seat is gone, no double-booking
+```
+
+Without `FOR UPDATE`, both transactions could read `available=true`, both decide to book, and both write — a classic lost update. `FOR UPDATE` serializes the two transactions, making one wait for the other to finish.
+
+### The Full Compatibility Table
+
+```
+                  FOR KEY   FOR      FOR NO KEY   FOR
+                  SHARE     SHARE    UPDATE       UPDATE
+FOR KEY SHARE      ✓         ✓          ✓            ✗
+FOR SHARE          ✓         ✓          ✗            ✗
+FOR NO KEY UPDATE  ✓         ✗          ✗            ✗
+FOR UPDATE         ✗         ✗          ✗            ✗
+```
+
+Read this as: "if someone already holds the lock on the left column, can I acquire the lock on the top row?" A ✓ means yes — both proceed. A ✗ means I block until they release.
+
+The pattern: the more you need to protect, the more you block. `FOR KEY SHARE` only conflicts with `FOR UPDATE`. `FOR UPDATE` conflicts with everyone.
+
+### NOWAIT and SKIP LOCKED
+
+By default, any blocked lock request waits until the lock is available. Two modifiers change this:
+
+**NOWAIT** — fail immediately if the lock cannot be acquired. Useful when you want to detect contention and handle it in application code rather than queuing.
 
 ```sql
--- Lock a row exclusively before updating it
-BEGIN;
-SELECT * FROM orders WHERE id = 42 FOR UPDATE;
--- Row 42 is now locked. Any other transaction trying FOR UPDATE blocks here.
-UPDATE orders SET status = 'processing' WHERE id = 42;
-COMMIT;
-
--- NOWAIT — fail immediately instead of waiting
+-- Fail immediately if row 42 is already locked
 SELECT * FROM orders WHERE id = 42 FOR UPDATE NOWAIT;
 -- ERROR: could not obtain lock on row in relation "orders"
-
--- SKIP LOCKED — skip rows that are already locked, return only available ones
-SELECT * FROM jobs
-WHERE  status = 'pending'
-ORDER  BY created_at
-FOR    UPDATE SKIP LOCKED
-LIMIT  1;
--- Returns the first unlocked pending job.
--- Multiple workers can run this concurrently — each gets a different row.
--- This is how you build a distributed job queue directly in PostgreSQL.
+-- Application can catch this and retry, queue the request, or return a friendly error
 ```
 
-`SKIP LOCKED` is one of PostgreSQL's most underused features. Without it, multiple workers pile up waiting for the same locked row. With it, each worker atomically claims a different available row and moves on.
+**SKIP LOCKED** — skip any row that is currently locked and return only the unlocked ones. This is the foundation of a reliable job queue.
+
+```
+Without SKIP LOCKED — three workers competing for the same job:
+
+Step 1: Worker 1 → locks job id=101 ✓
+Step 2: Worker 2 → tries to lock job id=101 → BLOCKS waiting for Worker 1
+Step 3: Worker 3 → tries to lock job id=101 → BLOCKS waiting for Worker 1
+Step 4: Worker 1 finishes, releases lock
+Step 5: Worker 2 gets the lock — but the job is already done
+Step 6: Worker 3 eventually gets it too — wasted
+
+With SKIP LOCKED — three workers each get a different job:
+
+Step 1: Worker 1 → locks job id=101 ✓
+Step 2: Worker 2 → skips id=101 (locked), locks id=102 ✓
+Step 3: Worker 3 → skips id=101 and id=102, locks id=103 ✓
+All three proceed simultaneously, no waiting, no duplicates
+```
+
+```sql
+-- Job queue with SKIP LOCKED
+BEGIN;
+SELECT id, payload
+FROM   jobs
+WHERE  status = 'pending'
+ORDER  BY priority DESC, created_at ASC
+FOR    UPDATE SKIP LOCKED
+LIMIT  1;
+-- Each worker atomically claims a different available job
+-- Process the job, then:
+UPDATE jobs SET status = 'done' WHERE id = $1;
+COMMIT;
+```
 
 ### Table-Level Locks
 
-Table-level locks apply to the entire table. PostgreSQL acquires them automatically for DDL and certain DML. The hierarchy from least to most restrictive:
+Table-level locks apply to the entire table at once. PostgreSQL acquires them automatically — you rarely set them manually. The one that matters most in production is `ACCESS EXCLUSIVE`.
+
+`ACCESS EXCLUSIVE` is acquired by `ALTER TABLE`, `DROP TABLE`, `TRUNCATE`, and `VACUUM FULL`. It blocks **everything** — reads and writes. The dangerous scenario:
 
 ```
-ACCESS SHARE           → SELECT
-                         compatible with everything except ACCESS EXCLUSIVE
+Production table with 50 million rows.
+Constant traffic: hundreds of queries per second.
 
-ROW SHARE              → SELECT FOR UPDATE / FOR SHARE
-                         blocks EXCLUSIVE and ACCESS EXCLUSIVE
+Step 1: Long-running SELECT takes 30 seconds (normal analytics query)
+Step 2: ALTER TABLE ADD COLUMN arrives
+        → wants ACCESS EXCLUSIVE
+        → queues behind the 30-second SELECT → WAITS
 
-ROW EXCLUSIVE          → INSERT, UPDATE, DELETE
-                         blocks SHARE, SHARE ROW EXCLUSIVE, EXCLUSIVE, ACCESS EXCLUSIVE
+Step 3: New queries keep arriving
+        → they want ACCESS SHARE (normal SELECT)
+        → ACCESS SHARE is blocked by the waiting ACCESS EXCLUSIVE request
+        → all new queries QUEUE behind the ALTER TABLE
 
-SHARE UPDATE EXCLUSIVE → VACUUM, ANALYZE, CREATE INDEX CONCURRENTLY
-                         blocks itself and everything above
-
-SHARE                  → CREATE INDEX (non-concurrent)
-                         blocks all writes, allows reads
-
-SHARE ROW EXCLUSIVE    → CREATE TRIGGER
-                         blocks all writes and SHARE
-
-EXCLUSIVE              → blocks everything except ACCESS SHARE (reads still work)
-
-ACCESS EXCLUSIVE       → ALTER TABLE, DROP TABLE, TRUNCATE, VACUUM FULL
-                         blocks EVERYTHING including SELECT
+Step 4: After 30 seconds, the SELECT finishes
+        → ALTER TABLE acquires ACCESS EXCLUSIVE, runs for 5 seconds
+Step 5: ALTER TABLE finishes, releases lock
+Step 6: 100 queued queries suddenly all execute at once → spike
 ```
 
-`ACCESS EXCLUSIVE` is the dangerous one. Any DDL needing it blocks all queries — including reads — until the lock is granted. On a busy table with long-running queries, the `ALTER TABLE` waits for existing queries to finish, then a growing queue of new queries piles up behind it while it runs.
+This is how a schema migration takes down a production system. The `ALTER TABLE` itself might only take 5 seconds, but it blocks all traffic for 35 seconds while it waits for the long query, then processes the backlog.
+
+Mitigation strategies: use `CREATE INDEX CONCURRENTLY` instead of `CREATE INDEX` (acquires `SHARE UPDATE EXCLUSIVE` instead of `SHARE` — much lighter), add nullable columns with no default (instant in PostgreSQL 11+), and always set `lock_timeout` so a migration fails fast rather than queueing silently.
 
 ```sql
--- This blocks ALL reads and writes on users for the full duration
+-- Safe migration pattern: fail fast if the lock is not immediately available
+SET lock_timeout = '2s';
 ALTER TABLE users ADD COLUMN preferences JSONB;
+-- ERROR: canceling statement due to lock timeout  (if a long query is running)
+-- Better to fail and retry at a quieter time than to queue and cause an outage
 
--- Check if anything is waiting for a lock right now
+-- Check who currently holds locks on a table
 SELECT
     pid,
     relation::regclass     AS table_name,
     mode,
     granted,
     pg_blocking_pids(pid)  AS blocked_by,
-    query
+    left(query, 80)        AS query_snippet
 FROM  pg_locks
 JOIN  pg_stat_activity USING (pid)
-WHERE relation IS NOT NULL
-ORDER BY granted, pid;
+WHERE relation = 'users'::regclass
+ORDER BY granted DESC, pid;
 
--- Find exactly who is blocking whom
+-- Find exactly who is blocking whom right now
 SELECT
     blocked.pid        AS blocked_pid,
     blocked.query      AS blocked_query,
@@ -284,9 +418,7 @@ JOIN  pg_stat_activity blocking
 WHERE NOT blocked.granted;
 ```
 
-The second query is what you run when users report slowness and you suspect lock contention. It shows you exactly which query is blocking another, what the blocking query is, and whether it is idle (forgot to commit) or actively running.
-
-> **Takeaway**: Row-level locks allow concurrent access to different rows. `ACCESS EXCLUSIVE` blocks everything — plan DDL migrations carefully. `FOR UPDATE SKIP LOCKED` is essential for job queues. Monitor `pg_locks` and `pg_stat_activity` to diagnose contention in production.
+> **Takeaway**: The four row lock modes exist because not all writes are equal. `FOR KEY SHARE` is for foreign key checks — only blocks deletions. `FOR SHARE` freezes a row for readers. `FOR NO KEY UPDATE` owns the row but allows foreign key checks to proceed. `FOR UPDATE` owns everything. `SKIP LOCKED` turns lock contention into parallel execution — essential for job queues. `ACCESS EXCLUSIVE` from DDL blocks all traffic — always set `lock_timeout` on migrations.
 
 ---
 
