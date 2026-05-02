@@ -1,4 +1,9 @@
-# Building a Production Job Queue in Go: Concurrency, Tradeoffs, and Getting It Right
+---
+title: "Building a Production Job Queue in Go: Concurrency, Tradeoffs, and Getting It Right"
+date: "2026-5-2"
+readTime: "15 min read"
+category: "System Design"
+---
 
 ## Introduction
 
