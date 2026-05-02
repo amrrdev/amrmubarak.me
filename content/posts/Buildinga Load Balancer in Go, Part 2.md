@@ -1,6 +1,6 @@
 ---
 title: "Building a Load Balancer in Go, Part 2: Health Checks"
-date: "2026-5-2"
+date: "2026-5-3"
 readTime: "15 min read"
 category: "System Design"
 ---

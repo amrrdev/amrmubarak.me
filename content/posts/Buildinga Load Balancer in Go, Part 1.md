@@ -1,6 +1,6 @@
 ---
 title: "Building a Load Balancer in Go, Part 1: Reverse Proxy and Round Robin"
-date: "2026-5-2"
+date: "2026-5-3"
 readTime: "15 min read"
 category: "System Design"
 ---
