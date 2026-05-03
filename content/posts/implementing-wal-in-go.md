@@ -176,41 +176,46 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 )
 
 const (
 	// maxSegmentSize is the maximum byte size of a single log segment file
 	// before rotation. 64MB matches PostgreSQL's default wal_segment_size.
-	// Smaller segments mean more files but faster deletion of old log data.
 	maxSegmentSize = 64 * 1024 * 1024 // 64MB
 
-	// bufferSize is the size of the write buffer in front of the log file.
-	// Writes smaller than this are buffered in memory and flushed together,
-	// reducing the number of write() syscalls. The buffer is always flushed
-	// before fsync — fsync on an unflushed buffer only syncs what the kernel
-	// has seen, not what is still in userspace memory.
+	// bufferSize is the size of the userspace write buffer in front of the file.
+	// Writes are accumulated here and flushed to the kernel in one syscall.
+	// The buffer is always explicitly flushed before fsync — fsync only
+	// operates on bytes the kernel has received, not bytes still in this buffer.
 	bufferSize = 4 * 1024 // 4KB
 )
 
 // WAL is a write-ahead log. It is safe for concurrent use.
 //
-// A WAL is implemented as a sequence of segment files named by their starting
-// LSN: 0000000000000000.log, 0000000000010000.log, etc.
-// Only the current (last) segment is open for writing.
-// All segments are read during recovery.
+// Segment files are named by their starting LSN in hex:
+//   0000000000000000.log  ← first segment, starts at byte offset 0
+//   0000000004000000.log  ← second segment, starts at byte offset 67108864 (64MB)
+//
+// LSN == byte offset within the global log stream across all segments.
+// Seeking to a known LSN is O(1): find the segment whose name is <= LSN,
+// then seek to (LSN - segmentStartLSN) within that file.
 type WAL struct {
 	mu      sync.Mutex
-	dir     string        // directory containing segment files
-	file    *os.File      // current segment file, open for writing
-	buf     *bufio.Writer // write buffer in front of file
-	nextLSN uint64        // LSN to assign to the next record
+	dir     string
+	file    *os.File      // active segment, open for appending
+	buf     *bufio.Writer // userspace buffer in front of file
+	nextLSN uint64        // byte offset where the next record will be written
 	size    int64         // current byte size of the active segment
 }
 
-// Open opens a WAL rooted at dir, creating it if it does not exist.
-// It replays any existing segments to restore nextLSN.
-// Call Recover() separately if you need the replayed records.
+// Open opens a WAL rooted at dir, creating the directory if needed.
+// If existing segments are found, the active segment is reopened for
+// appending and nextLSN is restored. Call Recover() to replay records
+// into application state.
 func Open(dir string) (*WAL, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create wal dir: %w", err)
@@ -218,133 +223,130 @@ func Open(dir string) (*WAL, error) {
 
 	w := &WAL{dir: dir}
 
-	// Scan existing segments to find the highest LSN written so far.
-	// This positions nextLSN correctly so new records do not reuse old LSNs.
-	if err := w.initLSN(); err != nil {
+	segments, err := w.sortedSegments()
+	if err != nil {
 		return nil, err
 	}
 
-	// Open (or create) the active segment file.
-	if err := w.openSegment(); err != nil {
-		return nil, err
+	if len(segments) == 0 {
+		// No existing segments — fresh start.
+		return w, w.openNewSegment()
 	}
 
-	return w, nil
+	// Existing segments found — reopen the last one for appending.
+	// initLSN computes nextLSN from the last segment's name + its file size,
+	// which gives the correct global byte offset for the next record.
+	if err := w.initLSN(segments); err != nil {
+		return nil, err
+	}
+	return w, w.reopenSegment(segments[len(segments)-1])
 }
 
-// initLSN scans all segment files to determine the next LSN to use.
-// It reads every record to find the highest LSN, then positions
-// nextLSN one record past that.
-func (w *WAL) initLSN() error {
+// sortedSegments returns all segment file paths sorted ascending by name.
+// Sorting by name is correct because names are zero-padded hex LSNs —
+// lexicographic order equals numeric order.
+// We sort explicitly rather than relying on filepath.Glob ordering,
+// which is platform-dependent.
+func (w *WAL) sortedSegments() ([]string, error) {
 	segments, err := filepath.Glob(filepath.Join(w.dir, "*.log"))
 	if err != nil {
-		return err
+		return nil, err
+	}
+	sort.Strings(segments)
+	return segments, nil
+}
+
+// initLSN computes nextLSN from the last segment.
+// nextLSN = startLSN encoded in the filename + current file size.
+// This maintains the LSN == global byte offset invariant across rotations.
+//
+// Example: last segment is "0000000004000000.log" (startLSN = 67108864)
+// and its current size is 1048576 bytes (1MB).
+// nextLSN = 67108864 + 1048576 = 68157440.
+func (w *WAL) initLSN(segments []string) error {
+	last := segments[len(segments)-1]
+
+	// Parse the starting LSN from the filename.
+	base := strings.TrimSuffix(filepath.Base(last), ".log")
+	startLSN, err := strconv.ParseUint(base, 16, 64)
+	if err != nil {
+		return fmt.Errorf("invalid segment filename %q: %w", last, err)
 	}
 
-	var maxLSN uint64
-	for _, seg := range segments {
-		f, err := os.Open(seg)
-		if err != nil {
-			return err
-		}
-		reader := bufio.NewReader(f)
-		for {
-			rec, err := decode(reader)
-			if err != nil {
-				break // EOF or corrupt tail — stop reading this segment
-			}
-			if rec.LSN > maxLSN {
-				maxLSN = rec.LSN
-			}
-		}
-		f.Close()
+	info, err := os.Stat(last)
+	if err != nil {
+		return fmt.Errorf("stat segment %q: %w", last, err)
 	}
 
-	if len(segments) > 0 {
-		// nextLSN must be beyond the last record we found.
-		// We use the physical file size of the last segment as the next LSN,
-		// so LSN == byte offset remains true for the new segment.
-		last := segments[len(segments)-1]
-		info, err := os.Stat(last)
-		if err != nil {
-			return err
-		}
-		w.nextLSN = uint64(info.Size())
-		_ = maxLSN // maxLSN is used only for validation in a production system
-	}
-
+	w.nextLSN = startLSN + uint64(info.Size())
 	return nil
 }
 
-// openSegment opens the current segment file for appending, creating it
-// if it does not exist. The filename encodes the starting LSN so the
-// file's position in the global log sequence is unambiguous.
-func (w *WAL) openSegment() error {
+// openNewSegment creates a new segment file named by the current nextLSN.
+// O_EXCL ensures we fail loudly if the file already exists — a new segment
+// must not exist. If it does, a previous rotation crashed mid-creation and
+// the file may contain garbage.
+func (w *WAL) openNewSegment() error {
 	name := filepath.Join(w.dir, fmt.Sprintf("%016x.log", w.nextLSN))
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		return fmt.Errorf("open segment %s: %w", name, err)
+		return fmt.Errorf("create segment %q: %w", name, err)
 	}
+	w.file = f
+	w.buf = bufio.NewWriterSize(f, bufferSize)
+	w.size = 0 // new segment is always empty
+	return nil
+}
 
+// reopenSegment opens an existing segment for appending.
+// Used on restart to continue writing into the active segment.
+// O_APPEND ensures all writes go to the end of the file at the kernel level,
+// even if the file position is not explicitly managed.
+func (w *WAL) reopenSegment(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("reopen segment %q: %w", path, err)
+	}
 	info, err := f.Stat()
 	if err != nil {
 		f.Close()
-		return err
+		return fmt.Errorf("stat segment %q: %w", path, err)
 	}
-
 	w.file = f
 	w.buf = bufio.NewWriterSize(f, bufferSize)
 	w.size = info.Size()
 	return nil
 }
 
-// Write appends a record to the log and syncs it to disk.
+// Write appends a record to the log and syncs it to stable storage before
+// returning. The returned LSN is the byte offset of this record in the
+// global log stream — it can be used to seek directly to this record.
 //
-// The sync happens unconditionally on every write. This is correct for
-// single-record durability — every write is immediately durable.
-// For higher throughput, group commit batches multiple writes before a
-// single fsync. We implement the simple version here.
-//
-// Write is safe to call from multiple goroutines concurrently.
+// Write is the hot path. Every call does: encode → bufio.Write → Flush → Sync.
+// The Flush before Sync is mandatory: file.Sync() only operates on bytes the
+// kernel has received. Bytes still in w.buf are invisible to the kernel and
+// would not be fsynced without an explicit Flush first.
 func (w *WAL) Write(recordType uint8, payload []byte) (uint64, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	lsn := w.nextLSN
-	rec := Record{
-		LSN:     lsn,
-		Type:    recordType,
-		Payload: payload,
-	}
+	encoded := encode(Record{LSN: lsn, Type: recordType, Payload: payload})
 
-	encoded := encode(rec)
-
-	// Write to the buffered writer. This may or may not issue a write()
-	// syscall — the buffer absorbs small writes and flushes when full.
 	if _, err := w.buf.Write(encoded); err != nil {
 		return 0, fmt.Errorf("buffer write: %w", err)
 	}
-
-	// Flush the userspace buffer to the kernel's page cache.
-	// This is required before fsync — fsync only operates on what the
-	// kernel has received. Bytes still in our bufio.Writer are invisible
-	// to fsync and would not be synced.
 	if err := w.buf.Flush(); err != nil {
-		return 0, fmt.Errorf("flush to kernel: %w", err)
+		return 0, fmt.Errorf("flush: %w", err)
 	}
-
-	// Sync the kernel's page cache to stable storage.
-	// After this returns, the record is durable — it survives any
-	// subsequent crash. This is the guarantee the WAL exists to provide.
 	if err := w.file.Sync(); err != nil {
 		return 0, fmt.Errorf("fsync: %w", err)
 	}
 
-	recordSize := int64(len(encoded))
-	w.nextLSN += uint64(recordSize)
-	w.size += recordSize
+	size := int64(len(encoded))
+	w.nextLSN += uint64(size)
+	w.size += size
 
-	// Rotate if the current segment has reached the size limit.
 	if w.size >= maxSegmentSize {
 		if err := w.rotate(); err != nil {
 			return 0, fmt.Errorf("rotate: %w", err)
@@ -354,34 +356,37 @@ func (w *WAL) Write(recordType uint8, payload []byte) (uint64, error) {
 	return lsn, nil
 }
 
-// rotate closes the current segment and opens a new one.
+// rotate closes the active segment and opens a new one.
 // Must be called with w.mu held.
+// The new segment's filename encodes the current nextLSN, which is the
+// byte offset immediately after the last record written to the old segment.
 func (w *WAL) rotate() error {
 	if err := w.file.Close(); err != nil {
-		return err
+		return fmt.Errorf("close segment: %w", err)
 	}
-	w.size = 0
-	return w.openSegment()
+	return w.openNewSegment()
 }
 
-// Recover replays all segments in order, calling fn for each valid record.
-// It stops at the first corrupt record (checksum mismatch or truncated header),
-// which indicates the tail of the last segment was written partially before a crash.
-// The corrupt record and everything after it is discarded — this is correct
-// because the operation was never acknowledged to the caller.
+// Recover replays all segments in LSN order, calling fn for each valid record.
+// It stops at the first corrupt record at the tail of the last segment —
+// this indicates a partial write from a crash. The corrupt tail is truncated.
+// Records in earlier segments are never truncated: a full segment that was
+// rotated away is assumed to be complete and correct.
 //
-// After Recover returns, the WAL is ready for new writes.
+// Recover must be called before any writes if existing segments are present.
+// It is safe to call on a fresh WAL with no segments — fn is never called.
 func (w *WAL) Recover(fn func(Record) error) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	segments, err := filepath.Glob(filepath.Join(w.dir, "*.log"))
+	segments, err := w.sortedSegments()
 	if err != nil {
 		return err
 	}
 
-	for _, seg := range segments {
-		if err := w.recoverSegment(seg, fn); err != nil {
+	for i, seg := range segments {
+		isLast := i == len(segments)-1
+		if err := w.recoverSegment(seg, isLast, fn); err != nil {
 			return err
 		}
 	}
@@ -389,7 +394,11 @@ func (w *WAL) Recover(fn func(Record) error) error {
 	return nil
 }
 
-func (w *WAL) recoverSegment(path string, fn func(Record) error) error {
+// recoverSegment replays one segment file.
+// If isLast is true, a corrupt record at the tail triggers truncation.
+// If isLast is false (fully rotated segment), corruption is a hard error —
+// a complete segment should never have a corrupt tail.
+func (w *WAL) recoverSegment(path string, isLast bool, fn func(Record) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -400,22 +409,33 @@ func (w *WAL) recoverSegment(path string, fn func(Record) error) error {
 	var lastGoodOffset int64
 
 	for {
-		// Track the byte offset before each read so we know where to truncate
-		// if the next record is corrupt.
-		offset, _ := f.Seek(0, io.SeekCurrent)
-
+		// Record the file offset before attempting to read the next record.
+		// bufio.Reader buffers ahead, so f.Seek gives the kernel-level position,
+		// not the reader-level position. We compensate by tracking lastGoodOffset
+		// manually as we successfully decode each record.
 		rec, err := decode(reader)
 		if err == io.EOF {
 			break // clean end of segment
 		}
 		if err != nil {
-			// Corrupt or truncated record at the tail.
-			// Truncate the file at the last known-good offset and stop.
-			log.Printf("WAL recovery: corrupt record at offset %d in %s, truncating",
-				offset, filepath.Base(path))
-			if terr := os.Truncate(path, lastGoodOffset); terr != nil {
-				return fmt.Errorf("truncate corrupt tail: %w", terr)
+			if !isLast {
+				// Corruption in a completed segment is unexpected and unrecoverable.
+				return fmt.Errorf("corrupt record in completed segment %s at offset %d: %w",
+					filepath.Base(path), lastGoodOffset, err)
 			}
+			// Corrupt tail of the active segment — partial write from a crash.
+			// Truncate at the last known-good offset and stop.
+			log.Printf("WAL: corrupt tail in %s at offset %d — truncating",
+				filepath.Base(path), lastGoodOffset)
+			if err := os.Truncate(path, lastGoodOffset); err != nil {
+				return fmt.Errorf("truncate corrupt tail: %w", err)
+			}
+			// Update nextLSN to reflect the truncated file.
+			// initLSN would recompute this on next Open, but we are already open.
+			base := strings.TrimSuffix(filepath.Base(path), ".log")
+			startLSN, _ := strconv.ParseUint(base, 16, 64)
+			w.nextLSN = startLSN + uint64(lastGoodOffset)
+			w.size = lastGoodOffset
 			break
 		}
 
@@ -423,19 +443,20 @@ func (w *WAL) recoverSegment(path string, fn func(Record) error) error {
 			return fmt.Errorf("recovery handler at LSN %d: %w", rec.LSN, err)
 		}
 
-		lastGoodOffset = offset + int64(headerSize+len(rec.Payload))
+		lastGoodOffset += int64(headerSize + len(rec.Payload))
 	}
 
 	return nil
 }
 
-// Close flushes and closes the active segment.
+// Close flushes the write buffer and closes the active segment.
+// The WAL must not be used after Close returns.
 func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	if err := w.buf.Flush(); err != nil {
-		return err
+		return fmt.Errorf("flush on close: %w", err)
 	}
 	return w.file.Close()
 }
