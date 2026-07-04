@@ -7,99 +7,90 @@ category: "Distributed Systems"
 
 ## What We're Building
 
-Ring is a cache cluster. Multiple nodes sit in front of an origin server. They absorb repeated requests so the origin doesn't keep answering the same question. Nodes can join, leave, or die, and the cluster keeps working. No coordinator process. No etcd. No external database. Every node discovers what's happening by talking directly to other nodes.
+Ring is a cache cluster. Multiple nodes sit in front of an origin server and soak up repeated requests so the origin doesn't have to keep answering the same question over and over. Nodes can join, leave, or die, and the cluster has to keep working anyway. There's no coordinator process, no etcd, no external database — every node figures out what's going on by talking to the other nodes directly.
 
-This post covers a smaller piece: what does _one_ node do when it gets _one_ HTTP request? Before building a cluster, you need a cache that's correct on its own. A distributed system with a broken cache just spreads the same bug across more nodes, with worse debugging.
+That's the end goal. This post is about something smaller: what does _one_ node do when it gets _one_ HTTP request? Before you build a cluster, you need a cache that's actually correct on its own. A distributed system that gets caching wrong doesn't get better by adding more nodes — it just gets the same bug in more places, with worse debugging.
 
 ## Why This Exists At All
 
-An origin server does real work per request — a database query, a page render, a calculation. That cost doesn't disappear just because the answer is the same as ten seconds ago. If a resource is hit a thousand times per second and the data behind it changes once per minute, about 59,999 out of 60,000 requests ask a question the system already answered. A cache answers those 59,999 without repeating the work.
+An origin server does real work for every request — a database query, rendering a page, some calculation — and that cost doesn't go away just because the answer happens to be the same as it was ten seconds ago. Say a resource gets hit a thousand times a second and the data behind it only changes once a minute. That means about 59,999 out of every 60,000 requests are asking a question the system already answered. A cache exists to answer those 59,999 without doing the work again.
 
 There are two ways to get this wrong, and they are not equally bad.
 
-**Cache too little.** You waste the opportunity. Origin load stays high, latency stays high. That's a performance problem — annoying, but easy to notice and fix.
+**Cache too little**, and you just waste the opportunity. Origin load stays high, latency stays high, and the cache basically isn't doing anything. That's a performance problem — annoying, but easy to notice and easy to fix.
 
-**Cache too much or cache the wrong thing.** You serve stale prices, stale inventory counts, or one person's private data to someone else. That's a correctness bug. It's worse because it doesn't announce itself. A conservative cache shows up in your latency graphs immediately. A cache that leaks responses shows up weeks later as a support ticket, and by then you have no idea how long it's been happening.
+**Cache too much, or cache the wrong thing**, and you serve stale prices, stale inventory counts, or one person's private data to a different person. That's a correctness bug, and it's worse than the performance problem because it doesn't announce itself. A cache that's too conservative shows up immediately in your latency graphs. A cache that occasionally leaks the wrong response to the wrong person shows up as a support ticket weeks later, and by then you have no idea how long it's been happening.
 
-That's why this post spends more time on HTTP's caching rules than on data structures. The data structures are easy. Doing the _correct_ thing — what the origin relies on — is where a cache earns trust.
+That's why the first half of this post is about HTTP's actual caching rules, not about data structures. The data structures are the easy part. Doing the _correct_ thing — the thing the origin is actually relying on — is where a cache either earns your trust or becomes something nobody wants to turn on.
 
-## The Four Questions
+## The Four Questions, In Full
 
-Every request that hits a cache must answer four questions, in this order.
+Every request that hits a cache has to answer four questions, in this order.
 
 ### 1. Is there a stored response for this exact request?
 
-The obvious approach: hash the URL, look it up. This is wrong in a subtle way — it passes every test you'd write unless you specifically test for the problem.
+The obvious answer is to hash the URL and look it up. That's wrong, and it's wrong in a sneaky way — it'll pass every test you write unless you specifically think to test for this.
 
-HTTP has a response header called `Vary`. A client sends `GET /api/users`. The origin answers with `Vary: Accept-Encoding`. That header is a promise. It tells any cache: "my answer depends on the client's `Accept-Encoding` header. Don't serve this response to a client that sent a different one."
+Here's the problem. HTTP has a response header called `Vary`. Say a client asks for `GET /api/users` and the origin answers with `Vary: Accept-Encoding` in its response. That header is a promise: the origin is telling any cache that its answer depends on the client's `Accept-Encoding` header, so don't give this response to a client that sent a different one.
 
-Why would the answer depend on that header? Compression. A client with `Accept-Encoding: gzip` gets compressed bytes. A client with `Accept-Encoding: identity` (or nothing) gets raw bytes.
+Why would the answer depend on that header? Compression. A client that says `Accept-Encoding: gzip` gets compressed bytes back, and a client that says `Accept-Encoding: identity` or nothing gets raw, uncompressed bytes. A cache that only keys on the URL grabs whichever one got stored first and hands it to everyone, compressed or not. A client that can't handle gzip gets garbled output, and a client that can gets uncompressed data that wastes bandwidth.
 
-What does "hash the URL" get you? Same URL, same method, but two different response bodies depending on who asks. A URL-only cache grabs whichever was stored first and hands it to everyone.
+`Accept-Encoding` is the textbook example, but `Vary: Cookie` is sharper — the response depends on session state carried in a cookie, and if a cache ignores that, it will sooner or later serve one logged-in user's personal response to a completely different user who happened to hit the same URL. This is not a rare edge case; it's one of the more common real-world cache-poisoning bugs, and it happens exactly because someone built the naive "just hash the URL" cache.
 
-Two failure modes:
-
-- A client that can't handle gzip gets gzipped bytes. Its browser tries to decompress plain text, and the response comes out corrupted.
-- A client that can handle gzip gets uncompressed bytes. Nothing crashes, but bandwidth is wasted.
-
-`Accept-Encoding` is the textbook example. `Vary: Cookie` is sharper. The response depends on session state in a cookie. If a cache ignores `Vary: Cookie` and treats a URL as one entry, it will serve one logged-in user's personal response to another user hitting the same URL. This is a real-world cache-poisoning bug, and it happens because someone built the naive "hash the URL" cache.
-
-The hard engineering constraint: `Vary` is part of the _response_. You don't know which headers matter for a URL until you've already gotten a response. The first request for any URL is unavoidably a cache miss. There's no clever trick to skip it. What you control is everything after — remembering exactly which headers `Vary` named, and using only those to distinguish later requests.
+The part that makes this a real engineering problem is that `Vary` is part of the _response_. You don't know which headers matter for a URL until you've already gotten a response for that URL, so the very first request for any URL has to be a cache miss, no matter what. There's no clever trick that skips that. What you _can_ control is everything after that first response — remembering exactly which headers `Vary` named and using only those headers to tell later requests apart.
 
 ### 2. If there's a stored response, is it still usable?
 
-`Cache-Control: max-age=60` looks simple: cache this for 60 seconds. As a starting model, fine. But the real spec has more pieces.
+`Cache-Control: max-age=60` looks simple — cache this for 60 seconds — and as a starting mental model that's fine. But the real spec has more pieces than that, and they matter.
 
-`s-maxage` lets an origin give a _shared_ cache (like Ring or a CDN) a different lifetime than a browser. A browser cache serves one person. A shared cache serves everyone. An origin can say: "browsers, cache this for 10 seconds. Shared caches, hold it for 5 minutes." Ignore `s-maxage` and you either serve fresher data than planned (straining infrastructure) or serve staler data to more people than intended.
+`s-maxage` lets an origin give a _shared_ cache like Ring or a CDN a different lifetime than it gives a browser. A browser cache only ever serves one person, but a shared cache serves everyone, so an origin might say "browsers, cache this for 10 seconds; shared caches, you can hold onto it for 5 minutes." Ignore `s-maxage` and you'll either serve fresher data than planned or serve staler data to more people than intended.
 
-`no-store` means never write this anywhere, ever — not even for revalidation. `private` means it's fine to cache, just not in a shared cache. A browser can hold it. Ring can't. Treating `private` as cacheable in a shared cache will eventually serve one person's data to someone else.
+`no-store` means never write this anywhere, ever. `private` is softer — it's fine to cache, just not in a shared cache. A browser can hold onto it, but Ring can't, and treating `private` as cacheable in a shared cache will eventually serve one person's private data to someone else.
 
-`must-revalidate` controls what happens when freshness runs out. Normally, the cache can serve stale data briefly while checking with the origin in the background. `must-revalidate` turns that off: once expired, ask the origin _first_ before serving anything. No benefit of the doubt, even if the origin is briefly unreachable. Origins set this on things where "close enough" costs real money: account balances, inventory counts.
+`must-revalidate` controls what happens when freshness runs out. Normally the cache can serve stale data briefly while checking with the origin in the background, but `must-revalidate` turns that off: once expired, ask the origin _first_ before serving anything, no benefit of the doubt. This is what an origin sets on things where "close enough" costs real money — account balances, inventory counts, that kind of thing.
 
 ### 3. Can it be served stale while a fresh copy is fetched?
 
-Without stale-while-revalidate, every request that lands right as something expires must wait for a full origin round trip. That defeats the point of having a cache. If something has `max-age=60` and is hit continuously, the person landing at second 61 shouldn't wait for a full origin fetch. The response from second 59 is still fine. Serve it immediately. Fetch a fresh copy in the background for the next person.
+Without stale-while-revalidate, every request that lands right as something expires has to wait for a full round trip to the origin before getting anything back, which defeats most of the point of having a cache. If something has `max-age=60` and is being hit continuously, the person whose request lands at second 61 shouldn't eat a full origin round trip just because of bad timing — the response from second 59 is still fine. Serve it immediately, then quietly go fetch a fresh copy in the background so the next person gets something current.
 
-The critical word is "bounded." Without a hard limit on how long something can be served stale, this becomes a way to accidentally disable freshness checking. If the origin goes down for six hours and there's no bound, the cache hands out six-hour-old data with no indication anything is wrong. Sometimes stale beats a 500 error — but that should be a deliberate decision, not an accident. Ring uses a fixed, cache-side stale window. The origin doesn't extend it.
+The word that matters most here is "bounded." Without a hard limit on how long something can be served stale, this stops being a smart latency trick and becomes a way to accidentally turn off freshness checking entirely. If the origin goes down for six hours, an unbounded cache just keeps confidently handing out six-hour-old data with no indication anything is wrong. Sometimes stale beats a 500 error, but that should be a deliberate decision, not something that happens by accident because nobody put a ceiling on it. Ring uses a fixed, cache-side stale window, and the origin doesn't get to extend it.
 
-### 4. If two hundred requests for the same expired resource arrive in the same ten milliseconds, does the origin get hit two hundred times or once?
+### 4. If two hundred requests for the same expired resource arrive in the same ten milliseconds, does the origin get hit two hundred times, or once?
 
-This decides whether your cache helps under normal load and hurts under the load pattern that matters most.
+This is the question that decides whether your cache helps under normal load and actively hurts under the load pattern that matters most.
 
-A resource is popular. Many concurrent requests want it. The freshness window closes. Every request checks the cache at nearly the same instant, and every one sees "expired." With no coordination, every request independently decides to fetch from origin. All at once.
+Walk through the mechanics slowly. A resource is popular — lots of concurrent requests want it. Its freshness window closes. Every one of those requests checks the cache at almost the same instant, and every one sees "expired" because from each request's own point of view, nothing new has been fetched yet. With no coordination, every single one independently decides to go fetch from origin, all at once. The exact moment your cache should be working hardest to protect the origin — a sudden spike in demand — is the moment an uncoordinated cache turns that spike into two hundred simultaneous hits on the origin.
 
-The moment your cache should work hardest to protect the origin — a sudden demand spike — is the moment an uncoordinated cache turns that spike into two hundred simultaneous origin hits.
-
-This is a thundering herd or cache stampede. The fix is conceptually simple: the first request that notices the miss fetches. Everyone else waits for that same fetch to finish. Simple to describe. There are real correctness issues in building it — two ways to get it wrong are covered later.
+This is called a thundering herd, or a cache stampede. The fix is conceptually simple: the first request that notices the miss goes and fetches, and everyone else just waits for that same fetch to finish. The real, sharp correctness issues are in building it, and we'll walk through two ways to get it wrong later.
 
 ## Walking Through an Actual Request
 
-Here's one request followed end-to-end. It's easier to hold as a sequence of events than as four abstract rules.
+Before any code, here's one request followed all the way through with real timestamps. It's easier to hold this as a sequence of events than as four abstract rules.
 
 Say `GET /api/products/42`. Origin answers with `Cache-Control: max-age=60`. Ring's fixed stale window is 30 seconds.
 
 | Time                                       | Event                                           | What happens                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------ | ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| t=0s                                       | First request comes in                          | Cache checks, finds nothing. Miss. Fetches from origin. Response comes back. Freshness: fresh until t=60s, stale-but-usable until t=90s. Entry stored. Client gets `Age: 0`.                                                                                                                                                                                                     |
-| t=5s                                       | Second request, different client, same URL      | Cache check: still fresh (5 < 60). Served directly. No origin contact. `Age: 5`.                                                                                                                                                                                                                                                                                                 |
-| t=59.999s, t=60.000s, t=60.001s            | Three requests land at the boundary             | All check at nearly the same instant. Some see fresh, some expired. Say all land just past t=60: all see "stale." Each gets the cached body immediately (no waiting) and triggers a background refresh.                                                                                                                                                                           |
-| t=60.001s                                  | Three background refreshes kick off             | All hit the coalescing mechanism on the same key. Exactly one talks to the origin. The other two wait for it to finish and use its result. Origin sees one request.                                                                                                                                                                                                               |
-| t=60.050s                                  | Refresh finishes                                | Origin replies "304, nothing changed" with updated `max-age=60`. Cache reuses the old body and calculates a new freshness window from now.                                                                                                                                                                                                                                       |
-| t=61s                                      | Fourth request                                  | Hits the refreshed entry. Fresh again. Served directly.                                                                                                                                                                                                                                                                                                                          |
-| t=200s (origin down since t=150s)          | Request for a hard-expired entry                | Entry is past the stale window. Not eligible to serve. Falls through to origin fetch. Origin fails. Client gets `502 Bad Gateway`. The cache does not quietly serve old data past its limit.                                                                                                                                                                                      |
+| t=0s                                       | First request comes in                          | Cache checks, finds nothing for this URL yet. Miss. Goes to fetch from origin — nobody else is fetching this, so it just does it. Response comes back. Freshness gets calculated: fresh until t=60s, stale-but-usable until t=90s. Entry gets stored. Client gets the response, with `Age: 0`.                                                                                   |
+| t=5s                                       | Second request, different client, same URL      | Cache checks, finds it, and it's still fresh (5 < 60). Served right away. No origin contact. `Age: 5`.                                                                                                                                                                                                                                                                           |
+| t=59.999s, t=60.000s, t=60.001s            | Three requests land right at the boundary       | All three check at nearly the same instant. Some might see fresh, some might see expired — that's fine, nothing requires this to be perfectly atomic across three separate observers. Say all three land just past t=60: all three see "stale." Each one gets served the still-cached body immediately — no waiting — and each one triggers a background refresh.                 |
+| t=60.001s                                  | Three background refreshes kick off             | All three go through the same coalescing mechanism, keyed on the same URL. Exactly one of them actually talks to the origin. The other two just wait for that one to finish and use its result. Origin sees one request, not three.                                                                                                                                              |
+| t=60.050s                                  | Refresh finishes                                | Origin replies "304, nothing changed," with an updated `max-age=60`. The cache reuses the old body — no need to re-send it — and calculates a new freshness window from now.                                                                                                                                                                                                     |
+| t=61s                                      | A fourth request comes in                       | Hits the new entry from the refresh at t=60.050s. Fresh again. Served directly.                                                                                                                                                                                                                                                                                                  |
+| t=200s (origin has been down since t=150s) | A request comes in for a now hard-expired entry | The cache checks — this entry is well past even the stale window. Not eligible to be served at all. Falls through to fetching from origin. Origin fails, because it's down. Client gets a `502 Bad Gateway`. The cache does _not_ quietly keep serving day-old data past its own limit.                                                                                           |
 
-That table is the whole system. Everything that follows is the code that makes each row work, or the reasoning for why it's built this way.
+That table is the whole system, mechanically. Everything from here on is either the code that makes each row true, or the reasoning for why it's built this way.
 
 ## Design
 
 Four pieces, one job each:
 
 - **`Entry`** — a snapshot of one cached response. Knows its own freshness and staleness boundaries.
-- **`Store`** — a size-limited LRU cache, keyed with a two-level Vary-aware scheme and normalized query parameters.
-- **`Flight`** — coalesces concurrent fetches into one.
-- **`Proxy`** — the `http.Handler` that wires the three above into the request path from the table.
+- **`Store`** — a size-limited LRU cache, keyed with the two-level Vary-aware scheme and normalized query parameters.
+- **`Flight`** — the piece that coalesces concurrent fetches into one.
+- **`Proxy`** — the actual `http.Handler` that wires the three above into the request path from the table.
 
-No external dependencies. Standard library only. This piece must be correct before anything else is built on top. Every dependency is another potential bug you haven't fully checked.
+No external dependencies — standard library only. This matters because this piece has to be correct before anything else gets built on top of it, and every dependency is one more thing that could have its own bug or change behavior under you.
 
 ### Entry
 
@@ -135,15 +126,13 @@ type Entry struct {
 }
 ```
 
-`Entry` never changes once created. Here's why.
+**Entry is immutable.** Once created, its fields never change, and that decision shapes everything around it.
 
-Imagine the alternative: mutable fields with a `sync.RWMutex`. A revalidation takes the write lock and updates `Body`, `FreshUntil`, and everything in place.
+Picture the alternative: mutable fields protected by a `sync.RWMutex`. When a revalidation finishes, it takes the write lock and updates `Body`, `FreshUntil`, and everything else in place. The problem is that writing a response body to a client takes real time — `w.Write(e.Body)` can be slow if the body is large or the client's connection is slow. If `Entry` were mutable, that write would need to hold a read lock the whole time, or you'd risk a data race with the revalidation mutating things underneath you. And a read lock held by one slow client blocks the write lock a revalidation needs, which means one slow client can stall a refresh for everyone else hitting that same key.
 
-The problem: `writeEntry` — writing the response body to a client — is not instant. `w.Write(e.Body)` takes real time for large bodies or slow client connections. If `Entry` were mutable, that write would need a read lock for its entire duration. The alternative — reading `Body` with no lock while a revalidation mutates it — is a data race. A read lock held by one slow client blocks the write lock a revalidation needs. One slow client stalls a refresh for everyone hitting that key.
+Immutable entries make that entire class of problem disappear. A revalidation never touches the `Entry` a slow client is currently reading — it builds a brand new one, and the `Store` swaps in a pointer to it. The slow client keeps reading from the old one for as long as it needs, and serve and refresh are two different values that never share the same memory at the same time.
 
-With immutable entries, this problem disappears. A revalidation never touches the `Entry` a slow client is reading. It builds a new `Entry`, and the `Store` swaps in a pointer. The slow client keeps reading the old one for as long as it needs. Serve and refresh are two different values, one after the other, never the same memory at the same time.
-
-The cost: one extra allocation per revalidation. For a cache refreshing popular keys periodically, that's a handful of allocations per minute per key. Cheap compared to readers waiting on writers.
+There's a cost: one extra allocation every time something gets revalidated. For a cache that's refreshing popular keys periodically, that's a handful of allocations per minute per key — cheap compared to readers never having to wait on writers.
 
 ### Freshness
 
@@ -201,9 +190,9 @@ func parseCacheControl(h http.Header) directives {
 }
 ```
 
-Unknown directives are silently skipped. This is deliberate. `Cache-Control` was designed to grow over time — origins send things like `immutable` or `stale-if-error` that this parser doesn't handle. If unknown directives caused an error, the cache would break when an origin ships a new header. This header was built to be safely ignorable.
+Notice what happens to a directive this parser doesn't recognize: nothing, it's just skipped. That's deliberate. `Cache-Control` was designed to grow over time, and real origins send things like `immutable` or `stale-if-error` that this parser has no case for. If unknown directives caused an error, the cache would break the first time an origin shipped a header this code hadn't been updated for, and ignoring what you don't understand is the right move for this specific header.
 
-`parseCacheControl` works for both request and response headers. Request and response share vocabulary (`no-cache`, `no-store`, `max-age`). Where the meaning changes by direction — a request's `no-cache` means "check with origin," a response's `no-cache` means "store but never serve without checking" — the caller handles the difference. `ServeHTTP` reads a request's `noCache` one way. `freshnessWindow` reads a response's `noCache` another way.
+`parseCacheControl` doesn't care if the header came from a request or a response — same function, either direction. Request and response share vocabulary like `no-cache`, `no-store`, and `max-age`, and where the meaning changes depending on direction, the caller handles it. `ServeHTTP` reads a request's `noCache` one way, and `freshnessWindow` reads a response's `noCache` a different way.
 
 ```go
 const staleWindow = 30 * time.Second
@@ -231,11 +220,11 @@ func freshnessWindow(now time.Time, d directives) (freshUntil, staleUntil time.T
 }
 ```
 
-The check order is the function's logic. `sMaxAge` beats `maxAge` when set — the shared-cache-specific number takes priority. Then `noCache` overrides and forces zero: the response is stored (useful for ETag-based revalidation) but never served without an origin check. If nothing is specified, the default is zero — no guessed "reasonable" TTL.
+The order of these checks is basically the whole function. `sMaxAge` wins over `maxAge` when it's set — the shared-cache-specific number takes priority. Then `noCache` overrides whatever we landed on and forces it to zero, meaning the response still gets stored but is never handed out without checking with the origin first. If nothing was specified at all, we default to zero rather than guessing some "reasonable" TTL.
 
-A response without freshness info is treated as immediately stale. Heuristic freshness — guessing a TTL from `Last-Modified` when nothing explicit is given — is spec'd but deliberately not implemented. Guessing wrong in the "too long" direction is the silent-staleness problem this whole post keeps returning to. Origins must be explicit. If they didn't say, we don't cache.
+That last part is a real choice. A response with no freshness info gets treated as immediately stale, not as "cache it for a while and hope for the best." There's a spec'd technique called heuristic freshness that guesses a TTL from a `Last-Modified` date, but this project doesn't do it because guessing wrong in the "cached too long" direction is exactly the silent-staleness problem this whole post keeps coming back to. If origins didn't say, we don't cache — that way we never guess wrong.
 
-`mustRevalidate` collapses `staleUntil` to equal `freshUntil`. One line. That's the entire implementation of "no stale-serving for this response." The origin opts something specific — account balances, inventory — out of the grace period.
+`mustRevalidate` collapsing `staleUntil` down to equal `freshUntil` is the entire implementation of "no stale-serving for this thing, ever." One line, and that's the origin opting something out of the grace period completely.
 
 ### Cache Keys
 
@@ -286,7 +275,7 @@ func primaryKey(r *http.Request) string {
 }
 ```
 
-This function exists because of a bug in the first version of this post. The bug type is worth understanding: it doesn't panic, throw an error, or show up when you manually test by typing the same URL twice (you naturally type params in the same order). It shows up weeks later as an unexplained low hit rate on endpoints where a client library builds query strings from an unordered structure like a map. The fix is nine lines of sorting. Noticing you needed it was the real work.
+This one's a good story. I got this wrong in the first version of this post and only noticed it going back over things for this rewrite. The interesting part is that this kind of bug doesn't announce itself — it doesn't panic, throw an error, or show up when you manually test by typing the same URL twice in the same order. It shows up weeks later as an unexplained low hit rate on endpoints where some client library happens to build its query string from something unordered, like a map. The fix is nine lines of sorting. Noticing you needed it is the actual work.
 
 ```go
 func secondaryKey(primary string, varyNames []string, r *http.Request) string {
@@ -308,13 +297,13 @@ func secondaryKey(primary string, varyNames []string, r *http.Request) string {
 }
 ```
 
-Two load-bearing choices:
+Two choices in this small function, and both matter.
 
-**Hashing.** Header values come from the client — uncontrolled input. A client can set `Accept-Encoding` or `Cookie` to anything, any length. Using raw values as part of a key lets a client control how much memory the key space consumes. Hashing to a fixed 16 bytes eliminates that regardless of which headers an origin varies on.
+First, hashing instead of just gluing raw header values together. Header values come from the client and are uncontrolled — a client can set `Accept-Encoding` or `Cookie` to anything, any length. Using those values directly as part of a key would let a client control how much memory the key space consumes. Hashing to a fixed 16 bytes closes that off regardless of which headers an origin decides to vary on.
 
-**The `\x00` separator.** Without a clear separator, two different header combinations could produce the same string before hashing. A NUL byte cannot legally appear in an HTTP header value, making the encoding unambiguous. Same principle as not building SQL queries by string concatenation: pick a separator the untrusted input cannot contain.
+Second, the `\x00` byte between each header name and value exists to stop a specific kind of collision. Without a clear separator, two different header combinations could glue together into the same string before hashing. A NUL byte can't legally appear in an HTTP header value, so using it as the separator makes the encoding unambiguous — there's exactly one way to have produced any given string.
 
-### Store: The LRU
+### Store: The LRU, In Detail
 
 ```go
 type node struct {
@@ -337,11 +326,11 @@ type Store struct {
 }
 ```
 
-Three maps, one list. `items` is the LRU — a map from key to list element, ordered by recency. `varyIndex` makes the two-level key scheme work: URL to the vary header names learned for it. `variants` makes purging correct: URL to the set of every secondary key that URL has produced.
+Three maps, one list. `items` is the actual LRU — a map from key to list element, where the list is ordered by recency. `varyIndex` makes the two-level key scheme work: URL to the vary header names we learned about it. `variants` makes purging correct: URL to the set of every secondary key that URL has ever produced.
 
-**Why a linked list, not a slice.** An LRU needs two fast operations: "move this to the front" (on hit) and "remove whatever's at the back" (on eviction). Both must be instant regardless of cache size. A slice can't move an element to the front without shifting everything before it — slower as the slice grows. A doubly linked list does both instantly when you have a pointer to the target node. The `items` map provides that pointer: from key to the list node. The map finds things. The list orders them. Neither alone solves the problem.
+**Why a linked list instead of a slice.** An LRU needs two operations to be fast: "move this to the front" on every hit, and "remove whatever's at the back" on eviction. Both need to be instant regardless of cache size, otherwise the cache gets slower the more you use it. A slice can't move something to the front without shifting everything before it, and a doubly linked list can do both instantly as long as you already have a pointer to the thing you're moving — which is exactly what the `items` map provides. The map finds things, the list keeps them ordered, and neither alone solves the problem.
 
-**Why LRU and not LFU.** LFU requires tracking a count per entry and finding the smallest count during eviction — either by scanning everything (slow) or maintaining a second structure (complexity on every access). LFU also has a known problem: something extremely popular yesterday but dead today sticks around because its count is still high. LRU's assumption is simpler: something used recently will likely be used again soon. That holds up well for HTTP cache traffic and is much cheaper to implement correctly.
+**Why LRU instead of LFU.** LFU means tracking a count per entry and finding the smallest count on eviction, either by scanning everything or keeping a second structure that gets updated on every single access. LFU also has a known problem where something that was popular yesterday and dead today sticks around because its count is still high. LRU's bet is simpler: something used recently will probably be used again soon, which holds up well for HTTP cache traffic and is much cheaper to implement correctly.
 
 ```go
 func (s *Store) Get(r *http.Request) (*Entry, bool) {
@@ -366,9 +355,9 @@ func (s *Store) Get(r *http.Request) (*Entry, bool) {
 }
 ```
 
-**Why not `RWMutex`?** This is a read-heavy structure. Most calls are `Get`, not `Set`. `RWMutex` exists for exactly that pattern. But `Get` isn't "just reading" — on a hit, it calls `MoveToFront`, which mutates the linked list. If `Get` took a read lock, two goroutines could both call `Get` simultaneously and both rearrange the list at the same time. That's a data race on the list's internal pointers — not wrong answers, but actual list corruption. Loops, lost entries.
+You might expect `RWMutex` here — this is a read-heavy structure — but `Get` isn't really "just reading." Every time it finds something, it calls `MoveToFront`, which mutates the linked list's internal structure. If `Get` took a read lock, two goroutines could both rearrange the list at the same time, which is a genuine data race on the list's internal pointers that could silently lose entries.
 
-The fix isn't "give the map an `RWMutex` and the list its own lock." Two locks create a new problem: lock ordering. Two goroutines grabbing them in opposite order is a deadlock risk. One plain `Mutex` covering everything is simple and correct: nothing can observe the map, list, and vary index in an inconsistent state, because only one goroutine touches any of them at a time. If this lock becomes a bottleneck, the standard fix is hash-based sharding into independent stores, each with its own lock — not switching lock types.
+The fix isn't to give the map an `RWMutex` and the list its own separate lock — that creates a lock ordering problem with no real benefit on a code path this simple. One plain `Mutex` covering everything keeps the whole thing obviously correct: nothing can ever observe the map, list, and vary index in an inconsistent state because only one goroutine touches any of them at a time. If this lock ever becomes a bottleneck, the standard fix is splitting into several independent stores with their own locks and routing keys by hash, not switching lock types.
 
 ```go
 func (s *Store) Set(r *http.Request, e *Entry, varyNames []string) {
@@ -418,9 +407,9 @@ func (s *Store) evictLocked() {
 }
 ```
 
-Eviction runs inline in `Set`, not on a timer or background goroutine. The upside: memory never exceeds the limit by more than one entry's worth. No window where the cache is over budget because cleanup hasn't run yet. In a container with a hard memory limit, this guarantee matters — "cleanup is behind" is the kind of thing that becomes an OOM kill at the worst time. The cost: a `Set` that needs to evict many entries pays for it inline. That's acceptable because `Get` is the hot path, and `Get` never evicts.
+Eviction happens inline every time `Set` pushes the store over its size limit, not on a timer or background goroutine. The upside is that at any moment, memory usage never exceeds the limit by more than one entry's worth — there's no window where things have gone over budget because a cleanup job hasn't run yet. If this is running in a container with a hard memory limit, that guarantee actually matters. The cost is that a `Set` that needs to evict many entries pays for all of that inline, but that's acceptable because `Set` was never the hot path — `Get` is, and `Get` never evicts anything.
 
-**Why `variants` exists.** `secondaryKey` is a one-way hash. Given a stored key, you cannot compute which URL it came from. When you need to purge every version of a URL (gzip, plain, whatever `Vary` produced), you can't derive that from hashed keys — the information is gone. `variants` remembers the URL-to-keys relationship on the side, so you never need to reconstruct what the hash already discarded.
+The reason `variants` exists is that `secondaryKey` is a one-way hash, so given a stored key there's no way to compute which URL it came from. When you need to purge every version of a URL — the gzipped copy, the plain copy, whatever else `Vary` produced — you can't figure that out from hashed keys because the information is gone. `variants` remembers the mapping on the side so you never need to reconstruct what the hash already threw away.
 
 ```go
 func (s *Store) DeleteAllVariants(primary string) {
@@ -436,9 +425,9 @@ func (s *Store) DeleteAllVariants(primary string) {
 }
 ```
 
-A `PURGE /some/path` request names one URL. The caller doesn't know how many Vary-based versions exist underneath. `DeleteAllVariants` walks only `variants[primary]` — the exact set of keys for that URL. A purge is equally fast whether the cache has 500 or 5 million entries. Without `variants`, you'd need to scan every entry in the store.
+A `PURGE /some/path` request names one URL, and the caller shouldn't have to know how many Vary-based versions exist underneath it. `DeleteAllVariants` only walks `variants[primary]` — the exact set of keys for that URL — so a purge is equally fast whether your cache has 500 entries or 5 million.
 
-### Singleflight
+### Singleflight, and Why the Obvious Alternatives Don't Work
 
 ```go
 type call struct {
@@ -476,9 +465,9 @@ func (f *Flight) Do(key string, fn func() (*Entry, error)) (*Entry, error) {
 }
 ```
 
-Two obvious approaches fail, and understanding why clarifies the real design.
+The best way to understand why this looks the way it does is to look at two more obvious designs and see exactly where each one breaks.
 
-**Attempt one: a per-key lock held for the entire fetch.**
+**Attempt one: a lock per key, held the whole time you're fetching.**
 
 ```go
 // DOES NOT actually coalesce — shown to explain why, not as usable code.
@@ -490,9 +479,9 @@ func (f *Flight) Do(key string, fn func() (*Entry, error)) (*Entry, error) {
 }
 ```
 
-This serializes concurrent requests but doesn't deduplicate them. Each goroutine still calls `fn` — they just take turns. 200 requests still means 200 origin calls, now sequential instead of parallel. The 200th request waits behind 199 fetches, and origin load is unchanged. This solves the wrong problem.
+This looks reasonable at first — only one goroutine can hold the lock at a time, so `fn` only ever runs one at a time per key. But "one at a time" and "runs once with everyone sharing that result" are two completely different things. Every goroutine still calls `fn` for itself — they just take turns doing it one after another instead of all simultaneously. Two hundred requests still means two hundred origin fetches, now sequential instead of concurrent, which is actually worse for the two-hundredth request.
 
-**Attempt two: check, then fetch, with nothing tying the steps together.**
+**Attempt two: check if something's in flight, then fetch, with nothing tying those steps together.**
 
 ```go
 // Has a race — shown to explain why, not as usable code.
@@ -508,11 +497,11 @@ func (f *Flight) Do(key string, fn func() (*Entry, error)) (*Entry, error) {
 }
 ```
 
-This is a classic check-then-act bug. Between `f.mu.Unlock()` after the check and whatever "wait somehow" does, a second goroutine can run the same check, find nothing registered, and call `fn()`. Checking "is something in flight" and registering "something is now in flight" must be atomic.
+This is a classic check-then-act bug. Look at the gap between `f.mu.Unlock()` after the check and whatever "wait somehow" ends up being. In that gap, a second goroutine can run the same check, also find nothing registered, and also go ahead and call `fn()`. Checking "is something in flight" and registering "something is now in flight" need to happen as one atomic step, and if they're split, two goroutines can both believe they're the first one there.
 
-The real `Do` holds the lock across both the check and the registration together, then releases it before calling `fn`. There's no reason for a slow fetch on one key to block unrelated keys from making progress.
+The real `Do` avoids this by holding the lock across both the check and the registration together, then releasing it before calling `fn` — because the actual fetch might be slow, and there's no reason for a slow fetch on one key to block every unrelated key from making progress.
 
-**The deletion order is critical.**
+**One more important detail: the entry gets removed from the map _after_ `wg.Done()`, never before.**
 
 ```go
 c.val, c.err = fn()
@@ -523,9 +512,9 @@ delete(f.calls, key)  // only now does the map forget this call happened
 f.mu.Unlock()
 ```
 
-`wg.Done()` runs before the map deletion, never after. If the order were reversed, there'd be a window where the call isn't marked "in flight" but hasn't finished either. A new request arriving in that window would see an empty map, conclude nothing is in flight, and start a redundant fetch. `Done()` first closes that window entirely. By the time the key disappears from the map, every waiter already has its answer.
+If you flipped that order — deleted from the map first, then called `Done()` — there'd be a small window where the call isn't marked as "in flight" anymore but also hasn't actually finished. A new request arriving in that window would correctly see nothing in the map, correctly conclude nothing is in flight, and go start a completely redundant second fetch. Doing `Done()` first closes that window entirely — by the time a key disappears from the map, everyone who was ever waiting on it has already gotten their answer.
 
-## Proxy: The Full Request Path
+## Proxy: The Full Request Path, Now With Client-Side Directives
 
 ```go
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -559,7 +548,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-The request's own `Cache-Control` matters too. A request with `Cache-Control: no-cache` — what a browser sends on hard refresh (Ctrl+Shift+R) — means "don't trust your cache, check with the origin." Miss this, and a hard refresh behaves identically to a regular refresh, which is a real bug.
+The first version of this post only looked at the response's `Cache-Control` header, but that's only half the picture. A request can carry `Cache-Control: no-cache` — this is what happens when you hard-refresh a browser with Ctrl+Shift+R — and it means "even if you think you have something fresh, don't trust it, go check with the origin first." Miss this, and a user's hard-refresh does nothing different from a regular refresh, which is a real bug someone will notice.
 
 ```go
 func writeEntry(w http.ResponseWriter, e *Entry, now time.Time) {
@@ -578,19 +567,19 @@ func writeEntry(w http.ResponseWriter, e *Entry, now time.Time) {
 }
 ```
 
-`Age` is a required header for shared caches under the HTTP spec. It keeps downstream caches correct about what Ring has done. If a browser sits behind Ring and Ring sends a response with `max-age=60` but no `Age`, the browser doesn't know the response might already be 45 seconds old. It assumes it's fresh and caches for another 60 seconds — the origin's intended 60-second window becomes 105 seconds. `Age` fixes this: the browser sees it and shortens its own freshness window.
+`Age` is a required header for a shared cache under the HTTP spec, and it's not just a formality — it's how everything downstream of this cache stays correct about what Ring is doing. If a browser sits behind Ring and Ring sends back a response with `max-age=60` but no `Age` header, the browser has no way of knowing that response might already be 45 seconds old. It'll assume it's brand new and cache it for another full 60 seconds, so what the origin meant as a 60-second window quietly turns into 105 seconds. `Age` fixes that: the browser sees it and shortens its own freshness window accordingly.
 
-Passing `now` explicitly instead of calling `time.Now()` in each function means the freshness decision and the `Age` value come from the same instant. Two separate time calls microseconds apart would create a small inconsistency between what the cache decided and what it told the client.
+Passing `now` in explicitly instead of each function grabbing the time on its own means the freshness decision and the number written into `Age` both come from the exact same instant, avoiding any inconsistency between what we decided and what we told the client.
 
-## Concurrency Correctness
+## Concurrency Correctness, Argued Directly
 
-**The claim:** no matter how many `Get`, `Set`, `Delete`, and `DeleteAllVariants` calls run concurrently, the result is always equivalent to executing them one at a time in some order. No caller ever observes a half-finished state.
+**The claim:** no matter how many `Get`, `Set`, `Delete`, and `DeleteAllVariants` calls happen at the same time from as many goroutines as you want, the end result is always the same as if they'd happened one at a time in some order. Nobody ever sees a half-finished state.
 
-**Why it's true:** every method touching the list, items map, vary index, or variants map acquires `s.mu` first and holds it for the entire operation. Go's `Mutex` guarantees mutual exclusion: when one goroutine unlocks, that unlock happens-before the next goroutine's lock succeeds. Two operations can never overlap in time. Every call sees exactly what the previous call left behind.
+**Why that's true:** every single method that touches the list, the items map, the vary index, or the variants map acquires `s.mu` first and holds it for the entire operation. Go's `Mutex` guarantees mutual exclusion: when one goroutine unlocks it, that unlock happens-before the next goroutine's lock succeeds, so two operations can never actually overlap in time. Every call runs as if it's the only thing happening, seeing exactly whatever the previous call left behind.
 
-The one thing requiring care: every line touching those four structures must be inside a locked section. No exceptions. The helper functions ending in "Locked" signal "the caller must already hold the lock." Go can't enforce this at compile time — it's a naming convention that every call site must respect. That's why all this logic lives in one file (`store.go`) instead of being spread across files where someone might not know the convention.
+The one thing that needs actual care: every line touching those four structures has to be inside a locked section, no exceptions. The helper functions ending in "Locked" signal that the caller must already be holding the lock, and Go doesn't enforce this at compile time — it's a naming convention that every call site must respect. That's exactly why all this logic lives in one file instead of being spread across files where someone might not know the convention exists.
 
-## Benchmarks
+## Benchmarks: Making the Coalescing Claim Measurable
 
 ```go
 const simulatedOriginLatency = 10 * time.Millisecond
@@ -619,34 +608,34 @@ func BenchmarkThunderingHerd_OriginCallCount(b *testing.B) {
 }
 ```
 
-Run it:
+Run it like this:
 
 ```
 go test ./cache/ -bench OriginCallCount -run ^$ -benchtime 1x
 ```
 
-This measures the concrete claim: 100 concurrent requests, same key, one origin call. Not "should be fast" — an actual number.
+This measures the real claim: 100 concurrent requests, same key, one origin call. Not "should be fast" — an actual number you could put in front of someone and defend.
 
-There's also a wall-clock benchmark pair (`WithoutCoalescing` vs `WithCoalescing`), but they need careful interpretation. Since all 100 fake origin calls in the uncoalesced version are just goroutines sleeping simultaneously, the wall-clock time is roughly the same either way (~10ms). The real cost of missing coalescing doesn't appear as slower wall-clock time in a benchmark — it appears as 100 real network calls to a real origin instead of 1. That's why `OriginCallCount` exists separately: wall-clock speed and origin load are different questions.
+There's also a pair of wall-clock benchmarks in the same file (`WithoutCoalescing` vs `WithCoalescing`), and they're worth running with a caveat: since all 100 fake origin calls in the uncoalesced version are just goroutines sleeping at the same time, the wall-clock time is roughly the same either way. The actual damage from missing coalescing doesn't show up as slower wall-clock time in this benchmark — it shows up as 100 real network calls hitting a real origin instead of 1. That's exactly why `OriginCallCount` exists as its own separate benchmark.
 
 ## What Production Adds Beyond This
 
-This is a complete, correct, single-node cache. But there's distance between this and production.
+This is a complete, correct, single-node cache, but there's real distance between this and something you'd point a huge amount of production traffic at.
 
-**Trusting the Host header.** The proxy trusts whatever the request's routing already decided. It doesn't independently validate that a request for one origin is actually meant for it. If the load balancer doesn't strictly validate `Host` before routing, someone could trick the cache into storing a response under the wrong key. This is a documented attack category. Closing it is an infrastructure-level guarantee, not something `cache/` alone can fix.
+**Trusting the Host header.** This proxy trusts whatever the request's routing already decided and doesn't independently verify that a request claiming to be for one origin is actually meant for it. If the load balancer in front of this cache doesn't strictly validate the `Host` header before routing, someone could trick this cache into storing a response under the wrong key. That's an infrastructure-level guarantee, not something `cache/` alone can fix.
 
-**Caching error responses.** Currently, only 2xx responses are cached. A URL that correctly 404s is fetched from origin every time, forever. Someone could exploit this by hammering known-missing URLs to generate load. A production version would want a short, capped negative cache for 404s with its own separate TTL.
+**Caching error responses.** Right now, only 2xx responses are cached, which is the safer default. But it means a URL that legitimately 404s gets hit with the full uncached origin round trip every single time forever, and someone could hammer known-missing URLs just to generate load. A production version would want a short, capped negative cache for 404s with its own separate TTL.
 
-**Visibility.** There's no way to see which keys are hot, which are cold, or what the hit rate is per endpoint. Not a correctness problem, but the kind of gap that turns a small production issue into a long, confusing one. "The cache seems slow" is a worse starting point than "the hit rate on `/api/search` dropped at 14:02."
+**Visibility.** There's no way to see which keys are hot, which are cold, or what the real hit rate looks like broken down by endpoint. That's not a correctness problem, but it's the kind of gap that turns a small production issue into a long, confusing one — "the cache seems slow" is much harder to debug than "the hit rate on `/api/search` dropped at 14:02."
+
+None of these change what Part 1 is: a correct, tested, single-node cache. This is just the honest list of what "correct on one node" doesn't cover yet.
 
 ## What's Next
 
-This node has no idea any other node exists. `HandlePurge` clears only the node it hits. Two Ring nodes in front of the same origin would each build their own separate cache with no way to coordinate.
+This node has no idea any other node exists. `HandlePurge` clears exactly the node it hits and only that node — two Ring nodes in front of the same origin would each build their own separate cache with no way to coordinate. That gap is deliberate: everything in this post needed to be solid and testable on its own before a second node enters the picture. Trying to debug a gossip protocol and a caching bug at the same time, on the same system, with no way to tell which is misbehaving, is a genuinely bad time.
 
-This is deliberate. Everything in this post — the Vary-aware keys, the LRU with its correctness argument, the singleflight coalescer — needed to be solid and testable alone before a second node enters the picture. Debugging a gossip protocol and a caching bug simultaneously, with no way to tell which is misbehaving, is a genuinely bad time.
-
-Part 2 introduces SWIM — the failure-detection protocol behind Consul and Cassandra. It answers "who's alive right now" with no central coordinator and without every node pinging every other node every round.
+Part 2 introduces SWIM, the failure-detection protocol behind Consul and Cassandra. It answers "who's alive right now" with no central coordinator and without every node pinging every other node every round.
 
 ## Repository
 
-Full source, including every test and benchmark, is in the `ring/` module: `cache/entry.go`, `cache/freshness.go`, `cache/key.go`, `cache/store.go`, `cache/singleflight.go`, `cache/proxy.go`, tests alongside each one, and a runnable reverse proxy in `cmd/ring/main.go`. Run the suite with `go test ./... -race` — since much of the correctness argument rests on concurrent access working correctly.
+Full source, including every test and benchmark mentioned in this post, is in the `ring/` module: `cache/entry.go`, `cache/freshness.go`, `cache/key.go`, `cache/store.go`, `cache/singleflight.go`, `cache/proxy.go`, tests alongside each one, and a runnable reverse proxy in `cmd/ring/main.go`. Run the whole suite with `go test ./... -race` — `-race` specifically, since much of the correctness argument rests on concurrent access working correctly.
