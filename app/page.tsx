@@ -7,7 +7,7 @@ export default function Home() {
   const posts = getAllPosts().slice(0, 3);
 
   return (
-    <div className="min-h-screen">
+    <>
       <Header />
       <main className="mx-auto max-w-6xl px-6 py-16 md:py-20">
         <section className="grid gap-12 lg:grid-cols-[1.3fr_0.7fr]">
@@ -151,6 +151,6 @@ export default function Home() {
           </div>
         </section>
       </main>
-    </div>
+    </>
   );
 }

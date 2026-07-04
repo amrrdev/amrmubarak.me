@@ -4,6 +4,7 @@ import { JetBrains_Mono, Newsreader, Space_Grotesk } from "next/font/google";
 import { Analytics } from "@vercel/analytics/next";
 import { Suspense } from "react";
 import { ThemeProvider } from "@/components/theme-provider";
+import { Footer } from "@/components/footer";
 import "./globals.css";
 
 const spaceGrotesk = Space_Grotesk({
@@ -28,9 +29,40 @@ const jetbrainsMono = JetBrains_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Blog - Thoughts on Engineering",
-  description: "Technical writing on distributed systems, databases, and software engineering",
-  generator: "v0.app",
+  title: {
+    default: "Amr Mubarak — Thoughts on Engineering",
+    template: "%s — Amr Mubarak",
+  },
+  description:
+    "Technical writing on distributed systems, databases, and software engineering",
+  metadataBase: new URL("https://amrmubarak.com"),
+  openGraph: {
+    title: "Amr Mubarak — Thoughts on Engineering",
+    description:
+      "Technical writing on distributed systems, databases, and software engineering",
+    url: "https://amrmubarak.com",
+    siteName: "Amr Mubarak",
+    locale: "en_US",
+    type: "website",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: "Amr Mubarak — Thoughts on Engineering",
+    description:
+      "Technical writing on distributed systems, databases, and software engineering",
+  },
+  robots: {
+    index: true,
+    follow: true,
+  },
+  icons: {
+    icon: [
+      { url: "/favicon.svg", type: "image/svg+xml" },
+    ],
+  },
+  other: {
+    "apple-touch-icon": "/favicon.svg",
+  },
 };
 
 const enableVercelAnalytics = process.env.NEXT_PUBLIC_ENABLE_VERCEL_ANALYTICS === "true";
@@ -46,7 +78,12 @@ export default function RootLayout({
         className={`${spaceGrotesk.variable} ${newsreader.variable} ${jetbrainsMono.variable} font-sans antialiased`}
       >
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
-          <Suspense fallback={<div>Loading...</div>}>{children}</Suspense>
+          <div className="flex min-h-dvh flex-col">
+            <Suspense fallback={<div>Loading...</div>}>
+              <div className="flex-1">{children}</div>
+            </Suspense>
+            <Footer />
+          </div>
           {enableVercelAnalytics ? <Analytics /> : null}
         </ThemeProvider>
       </body>

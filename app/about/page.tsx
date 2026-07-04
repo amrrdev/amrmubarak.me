@@ -2,7 +2,7 @@ import { Header } from "@/components/header";
 
 export default function About() {
   return (
-    <div className="min-h-screen">
+    <>
       <Header />
       <main className="mx-auto max-w-3xl px-6 py-16 md:py-20">
         <div className="mb-10 space-y-3">
@@ -38,6 +38,6 @@ export default function About() {
           </p>
         </div>
       </main>
-    </div>
+    </>
   );
 }

@@ -5,19 +5,19 @@ interface CategoryBadgeProps {
 
 const categoryColors: Record<string, { bg: string; text: string; border: string }> = {
   "Distributed Systems": {
-    bg: "bg-amber-500/15",
-    text: "text-amber-700 dark:text-amber-300",
-    border: "border-amber-500/30",
+    bg: "bg-indigo-500/15",
+    text: "text-indigo-700 dark:text-indigo-300",
+    border: "border-indigo-500/30",
   },
   "Database Internals": {
-    bg: "bg-teal-500/15",
-    text: "text-teal-700 dark:text-teal-300",
-    border: "border-teal-500/30",
-  },
-  "System Design": {
     bg: "bg-sky-500/15",
     text: "text-sky-700 dark:text-sky-300",
     border: "border-sky-500/30",
+  },
+  "System Design": {
+    bg: "bg-violet-500/15",
+    text: "text-violet-700 dark:text-violet-300",
+    border: "border-violet-500/30",
   },
   "AI Engineering": {
     bg: "bg-rose-500/15",
