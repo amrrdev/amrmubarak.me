@@ -7,7 +7,7 @@ export default function Archive() {
   const categories = getAllCategories();
 
   return (
-    <div className="min-h-screen">
+    <>
       <Header />
       <main className="mx-auto max-w-4xl px-6 py-16 md:py-20">
         <div className="mb-10 space-y-3">
@@ -24,6 +24,6 @@ export default function Archive() {
 
         <ArchiveList posts={posts} categories={categories} />
       </main>
-    </div>
+    </>
   );
 }

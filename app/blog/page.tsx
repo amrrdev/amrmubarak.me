@@ -7,7 +7,7 @@ export default function BlogPage() {
   const categories = getAllCategories();
 
   return (
-    <div className="min-h-screen">
+    <>
       <Header />
       <main className="mx-auto max-w-4xl px-6 py-16 md:py-20">
         <div className="mb-12 space-y-4">
@@ -24,6 +24,6 @@ export default function BlogPage() {
         </div>
         <BlogList posts={posts} categories={categories} />
       </main>
-    </div>
+    </>
   );
 }

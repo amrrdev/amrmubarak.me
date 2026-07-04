@@ -26,6 +26,9 @@ export function BlogList({ posts, categories }: BlogListProps) {
     return haystack.includes(normalizedQuery);
   });
 
+  const featured = filteredPosts.length > 0 ? filteredPosts[0] : null;
+  const rest = filteredPosts.length > 1 ? filteredPosts.slice(1) : [];
+
   return (
     <>
       <div className="mb-10 space-y-6">
@@ -45,7 +48,7 @@ export function BlogList({ posts, categories }: BlogListProps) {
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="Search by title, category, or content"
-                className="h-11 w-full rounded-full border border-border/60 bg-card/70 pl-10 pr-10 text-[14px] text-foreground shadow-sm transition focus:border-accent/60 focus:outline-none"
+                className="h-11 w-full rounded-full border border-border/60 bg-card/70 pl-10 pr-10 text-[14px] text-foreground shadow-sm transition focus:border-accent/60 focus:outline-none focus:ring-2 focus:ring-accent/10"
               />
               {query ? (
                 <button
@@ -102,7 +105,37 @@ export function BlogList({ posts, categories }: BlogListProps) {
         </div>
       ) : (
         <div className="space-y-6">
-          {filteredPosts.map((post) => (
+          {featured && (
+            <article className="group">
+              <Link href={`/blog/${featured.slug}`} className="block">
+                <div className="relative overflow-hidden rounded-2xl border-2 border-accent/20 bg-gradient-to-br from-accent/[0.03] to-transparent p-6 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-lg md:p-8">
+                  <span className="mb-4 inline-flex items-center rounded-full bg-accent/15 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.1em] text-accent">
+                    Latest
+                  </span>
+                  <div className="mb-3 flex flex-wrap items-center gap-3 text-[12px] text-muted-foreground">
+                    <CategoryBadge category={featured.category} />
+                    <span className="text-border">|</span>
+                    <time dateTime={featured.date} className="font-medium">
+                      {new Date(featured.date).toLocaleDateString("en-US", {
+                        year: "numeric",
+                        month: "short",
+                        day: "numeric",
+                      })}
+                    </time>
+                    <span className="text-border">|</span>
+                    <span>{featured.readTime}</span>
+                  </div>
+                  <h2 className="mb-3 text-[22px] font-semibold leading-snug text-foreground transition-colors group-hover:text-accent md:text-[26px]">
+                    {featured.title}
+                  </h2>
+                  <p className="max-w-2xl font-serif text-[15px] leading-relaxed text-muted-foreground/90">
+                    {featured.content.substring(0, 200)}...
+                  </p>
+                </div>
+              </Link>
+            </article>
+          )}
+          {rest.map((post) => (
             <article key={post.slug} className="group">
               <Link href={`/blog/${post.slug}`} className="block">
                 <div className="rounded-2xl border border-border/60 bg-card/80 p-6 shadow-sm transition-all duration-200 hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-lg">
