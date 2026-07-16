@@ -374,98 +374,170 @@ Use Hono when:
 
 ---
 
-## Part 4: Setting Up the Environment
+## Part 4: What We're Building — EdgeGate
 
-Before building EdgeGate, you need the Cloudflare CLI and a Cloudflare account.
+EdgeGate is an API gateway that sits between your users and your backend services. Instead of users hitting your backend directly, they hit EdgeGate, and EdgeGate handles routing, rate limiting, caching, and logging.
 
-### Installing wrangler
+Here's what it does:
 
-Wrangler is the CLI for deploying Cloudflare Workers.
+```
+User ──► edgegate.workers.dev
+              │
+              ▼
+      ┌──────────────┐
+      │  EdgeGate     │
+      │               │
+      │  1. Rate      │  Checks: has this IP exceeded the limit?
+      │     Limiter   │  Uses: Cloudflare KV
+      │               │
+      │  2. Cache     │  Checks: is this response cached?
+      │               │  Uses: Cloudflare KV
+      │               │
+      │  3. Router    │  Routes: /api/v1/* → JSONPlaceholder
+      │               │          /api/v2/* → httpbin
+      │               │          /health   → status
+      │               │
+      │  4. Logger    │  Logs: method, URL, status, latency
+      │               │  Uses: Cloudflare Analytics Engine
+      └──────────────┘
+              │
+              ▼
+      Your backend services
+```
+
+We'll build it step by step. Each step adds one feature, and after each step we'll test it with curl so you can see exactly what changed.
+
+### The Services We'll Route To
+
+We'll use two free public APIs as our backend services:
+
+- **JSONPlaceholder** (`jsonplaceholder.typicode.com`) — a fake REST API for prototyping. Returns JSON data for posts, users, todos.
+- **httpbin** (`httpbin.org`) — a request/response debugging service. Returns whatever you send it.
+
+You'll see EdgeGate forward requests to these services and cache the responses.
+
+---
+
+## Part 5: What Is Cloudflare KV?
+
+Before we build anything, you need to understand the storage system we'll use for rate limiting and caching.
+
+### The Problem
+
+In Part 2, you learned that V8 isolates are destroyed after each request (or reused unpredictably). You cannot store data in a variable and expect it to be there on the next request:
+
+```js
+// This DOES NOT work at the edge
+let requestCount = 0;
+
+export default {
+  async fetch(request) {
+    requestCount++;  // ← This resets to 0 on every request
+    return new Response(`Count: ${requestCount}`);
+  },
+};
+```
+
+A user requests this endpoint 10 times. They get "Count: 1" every time because each request runs in a fresh (or different) isolate. The variable `requestCount` is created, incremented, and destroyed with each request.
+
+To persist data across requests, you need storage that lives outside the isolate.
+
+### What Cloudflare KV Is
+
+**KV** stands for Key-Value. It's a globally replicated database that lives on every edge location. When you write a value to KV, it's eventually replicated to all 330+ Cloudflare locations.
+
+```
+Your code (inside isolate):
+  await KV.put("key", "value");  // Write
+
+Cloudflare's internal network:
+  KV.write → stored in local edge → replicated to other edges
+  ~60 seconds for full global replication
+
+Your code (inside isolate, maybe different location):
+  const val = await KV.get("key");  // Read
+  Returns: "value" (if replicated) or null (if not yet here)
+```
+
+**KV operations you need to know:**
+
+```
+KV.put(key, value, options)
+  Stores a value. Options can include:
+  - expirationTtl: time in seconds until auto-delete
+
+KV.get(key)
+  Reads a value. Returns the stored string or null.
+
+KV.getWithMetadata(key)
+  Reads a value and its metadata (additional data you stored with it).
+```
+
+**Why KV and not a normal database?**
+
+- KV is accessible from any edge location. Your code runs in Tokyo. A write from Tokyo needs to be readable in London. KV handles this replication.
+- KV has automatic TTL. You can set a value to expire after N seconds. This is perfect for rate limiting — old rate limit windows clean themselves up.
+- KV has no connection pooling, no SQL queries, no schema. You put a string, you get a string.
+
+### What We'll Store in KV
+
+EdgeGate uses two KV namespaces (think of them as separate buckets):
+
+```
+RATE_LIMIT namespace:
+  Key:   "ratelimit:1.2.3.4:17"   (IP address + time window)
+  Value: "5"                       (request count for this IP in this window)
+  TTL:   10 seconds                (window auto-expires)
+
+CACHE namespace:
+  Key:   "cache:GET:/api/v1/posts/1"  (HTTP method + URL path)
+  Value: "{status:200, headers:{...}, body:...}" (serialized response)
+  TTL:   60 seconds                     (cache duration)
+```
+
+---
+
+## Part 6: Project Setup
+
+We'll set up the project, configure KV, and write the first Hono application. Every command and every file is explained as we write it.
+
+### Step 6.1: Install wrangler
+
+Wrangler is the CLI tool for deploying Cloudflare Workers. It handles authentication, bundling your code, and deploying to Cloudflare's network.
 
 ```bash
 npm install -g wrangler
 ```
 
-Verify the installation:
+Verify it installed:
 
 ```bash
 wrangler --version
 ```
 
-### Authenticating with Cloudflare
+### Step 6.2: Authenticate with Cloudflare
 
 ```bash
 wrangler login
 ```
 
-This opens a browser window asking you to authorize wrangler with your Cloudflare account. You need a Cloudflare account (free tier is sufficient for this project).
+This opens a browser. You log into your Cloudflare account and authorize wrangler. After this, wrangler can deploy Workers to your account. You need a free Cloudflare account — no credit card required for the Workers free plan.
 
-### Creating the Project
+### Step 6.3: Create the project directory
 
 ```bash
 mkdir edgegate
 cd edgegate
 npm init -y
 npm install hono
+npm install -D @cloudflare/workers-types
 ```
 
-### Wrangler Configuration
+`npm init -y` creates a `package.json` file. `npm install hono` installs the Hono framework. `npm install -D @cloudflare/workers-types` installs TypeScript type definitions for Cloudflare Workers (so your editor knows what `KVNamespace` and `AnalyticsEngineDataset` look like).
 
-Create `wrangler.toml` in the project root:
+### Step 6.4: Configure TypeScript
 
-```toml
-name = "edgegate"
-main = "src/index.ts"
-compatibility_date = "2024-12-01"
-
-# KV namespace for rate limiting
-[[kv_namespaces]]
-binding = "RATE_LIMIT"
-id = ""   # You'll create this in a moment
-
-# KV namespace for response caching
-[[kv_namespaces]]
-binding = "CACHE"
-id = ""  # You'll create this in a moment
-
-# Analytics Engine for logging
-[[analytics_engine_datasets]]
-binding = "ANALYTICS"
-dataset = "edgegate_logs"
-```
-
-Create the KV namespaces:
-
-```bash
-wrangler kv:namespace create RATE_LIMIT
-# Output: SUCCESS  SUCCESS  Created KV namespace with id: abc123
-
-wrangler kv:namespace create CACHE
-# Output: SUCCESS  SUCCESS  Created KV namespace with id: def456
-```
-
-Copy the IDs from the output into your `wrangler.toml`.
-
-### Project Structure
-
-```
-edgegate/
-├── wrangler.toml          # Cloudflare Worker configuration
-├── package.json
-├── tsconfig.json
-├── src/
-│   ├── index.ts           # Entry point — creates the Hono app
-│   ├── middleware/
-│   │   ├── rate-limiter.ts # Per-IP rate limiting using KV
-│   │   ├── cache.ts        # Response caching at the edge
-│   │   └── logger.ts       # Analytics logging
-│   ├── routes/
-│   │   ├── proxy.ts        # Backend proxy routes
-│   │   └── health.ts       # Health check endpoint
-│   └── config.ts           # Configuration constants
-```
-
-### TypeScript Configuration
+Create `tsconfig.json`:
 
 ```json
 {
@@ -481,86 +553,328 @@ edgegate/
 }
 ```
 
-Install the Workers types:
+This tells TypeScript to target modern JavaScript, use ESM module resolution, include Cloudflare Worker types, and produce type-checked output (without emitting files — wrangler handles compilation).
+
+### Step 6.5: Create KV namespaces
+
+We need two KV namespaces. Think of them as separate storage buckets:
 
 ```bash
-npm install -D @cloudflare/workers-types
+wrangler kv:namespace create RATE_LIMIT
+# Output: Created KV namespace with id: abc123def456...
+
+wrangler kv:namespace create CACHE
+# Output: Created KV namespace with id: 789ghi...-
 ```
+
+Write down both IDs. You'll need them in the next step.
+
+### Step 6.6: Configure wrangler
+
+Create `wrangler.toml` — this file tells Cloudflare what your Worker is and what resources it needs:
+
+```toml
+name = "edgegate"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+
+[[kv_namespaces]]
+binding = "RATE_LIMIT"
+id = "abc123def456..."  # ← Paste the ID from step 6.5
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "789ghi..."         # ← Paste the ID from step 6.5
+```
+
+Each field means:
+
+- **`name`** — The name of your Worker on Cloudflare. Deploys to `edgegate.your-account.workers.dev`.
+- **`main`** — Which file contains the fetch handler (the entry point).
+- **`compatibility_date`** — Which version of the Workers runtime to use. Always set this to today's date or recent.
+- **`[[kv_namespaces]]`** — Each block declares a KV namespace binding. `binding` is the JavaScript variable name you'll use in code (e.g., `c.env.RATE_LIMIT`). `id` is the namespace you created.
+
+### Step 6.7: Project structure
+
+```
+edgegate/
+├── wrangler.toml       # Worker configuration
+├── package.json
+├── tsconfig.json
+├── src/
+│   └── index.ts        # Our application code (starts small, grows)
+```
+
+We'll start with everything in one file. As it grows, we'll split into `middleware/` and `routes/` directories.
 
 ---
 
-## Part 5: Building EdgeGate
+## Part 7: Building EdgeGate Step by Step
 
-### Step 1: The Entry Point
+### Step 7.1: Hello World (First Route)
 
-The entry point creates the Hono application, registers middleware and routes, and exports the fetch handler that Cloudflare Workers calls.
+Let's start with the simplest possible Hono application — a single endpoint that returns "Hello Edge" to prove everything works.
+
+Create `src/index.ts`:
 
 ```typescript
-// src/index.ts
 import { Hono } from "hono";
-import { rateLimiter } from "./middleware/rate-limiter";
-import { edgeCache } from "./middleware/cache";
-import { requestLogger } from "./middleware/logger";
-import { proxyRoutes } from "./routes/proxy";
-import { healthRoutes } from "./routes/health";
 
-// Bindings injected by Cloudflare Workers
-type Bindings = {
-  RATE_LIMIT: KVNamespace;
-  CACHE: KVNamespace;
-  ANALYTICS: AnalyticsEngineDataset;
-};
+const app = new Hono();
 
-const app = new Hono<{ Bindings: Bindings }>();
-
-// Global middleware (applied to all routes)
-app.use("*", requestLogger);
-app.use("*", rateLimiter);
-
-// Route groups
-app.route("/health", healthRoutes);
-app.route("/api", proxyRoutes);
-
-// Error handling
-app.onError((err, c) => {
-  console.error(`Unhandled error: ${err.message}`);
-  return c.json({ error: "Internal Server Error" }, 500);
-});
-
-// 404 handling
-app.notFound((c) => {
-  return c.json({ error: "Not Found" }, 404);
+app.get("/", (c) => {
+  return c.text("Hello Edge");
 });
 
 export default app;
 ```
 
-Key things to understand:
+**What each line does:**
 
-- **`app.use("*", middleware)`** applies middleware to all routes. You can also scope it: `app.use("/api/*", middleware)` applies only to `/api/*` paths.
-- **`app.route("/health", healthRoutes)`** mounts the routes from `healthRoutes` under the `/health` prefix. This is how you organize routes into groups.
-- **`app.onError()`** catches any error thrown in middleware or route handlers. Without this, an uncaught error returns a generic 500 with no body.
-- **`app.notFound()`** catches requests that don't match any registered route.
+- `new Hono()` — Creates the Hono application. This is your app object. You register routes and middleware on it.
+- `app.get("/", handler)` — Registers a route. When an HTTP GET request arrives at `/`, the handler function runs. Hono supports `app.get()`, `app.post()`, `app.put()`, `app.delete()`, and `app.all()` (any method).
+- `c.text("Hello Edge")` — Returns a plain text response. Hono provides `c.text()`, `c.json()`, `c.html()`, and `c.body()` for different response types.
+- `export default app` — This is what Cloudflare Workers needs. Your fetch handler must be the default export. Hono's app satisfies the Worker's fetch handler interface.
 
-### Step 2: Configuration
+**Run it locally:**
+
+```bash
+wrangler dev
+```
+
+This starts a local server at `http://localhost:8787`. Open it in your browser or:
+
+```bash
+curl http://localhost:8787/
+# Response: Hello Edge
+```
+
+Congratulations. You just ran a Hono application on Cloudflare Workers. It's deployed to your local machine, but the same code runs on all 330+ Cloudflare locations when deployed.
+
+### Step 7.2: Health Check Endpoint
+
+Now let's add a health check — an endpoint that returns JSON with the status of the system. This is your first JSON response with Hono.
+
+Add this route to `src/index.ts`:
 
 ```typescript
-// src/config.ts
+app.get("/health", (c) => {
+  return c.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
+```
+
+Your full file should now look like:
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+app.get("/", (c) => {
+  return c.text("Hello Edge");
+});
+
+app.get("/health", (c) => {
+  return c.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+export default app;
+```
+
+**What changed:**
+
+- `c.json({...})` — Returns a JSON response. Hono automatically sets the `Content-Type: application/json` header.
+- The health endpoint will grow later to check KV connectivity and upstream reachability. For now it just returns a static status.
+
+**Test it:**
+
+```bash
+wrangler dev  # Make sure this is still running
+
+curl http://localhost:8787/health
+# Response: {"status":"healthy","timestamp":"2026-07-15T12:00:00.000Z"}
+```
+
+### Step 7.3: Proxy Routes (Forwarding Requests to a Backend)
+
+Now for the core feature: EdgeGate as a proxy. When a request hits `/api/v1/*`, we forward it to JSONPlaceholder. When it hits `/api/v2/*`, we forward it to httpbin.
+
+This is where we use `fetch()` inside a Worker — the same `fetch()` that runs in the browser, but on the server side.
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+app.get("/", (c) => c.text("Hello Edge"));
+
+app.get("/health", (c) => {
+  return c.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
+
+// Proxy route: /api/v1/* → jsonplaceholder.typicode.com
+app.get("/api/v1/*", async (c) => {
+  // Step 1: Extract the path after /api/v1
+  //   Request: GET /api/v1/posts/1
+  //   url.pathname = "/api/v1/posts/1"
+  //   targetPath = "/posts/1"
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v1", "");
+
+  // Step 2: Build the target URL
+  const targetUrl = `https://jsonplaceholder.typicode.com${targetPath}${url.search}`;
+
+  // Step 3: Forward the request using fetch()
+  // fetch() inside a Worker sends an HTTP request to the target server
+  // We forward the original request headers so the backend sees them
+  const response = await fetch(targetUrl, {
+    headers: c.req.raw.headers,
+  });
+
+  // Step 4: Add our own headers to the response
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");  // So the client knows it went through us
+
+  // Step 5: Return the forwarded response
+  return new Response(response.body, {
+    status: response.status,
+    headers,
+  });
+});
+
+// Proxy route: /api/v2/* → httpbin.org
+app.get("/api/v2/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v2", "");
+  const targetUrl = `https://httpbin.org${targetPath}${url.search}`;
+
+  const response = await fetch(targetUrl, {
+    headers: c.req.raw.headers,
+  });
+
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+
+  return new Response(response.body, {
+    status: response.status,
+    headers,
+  });
+});
+
+export default app;
+```
+
+**Understanding the proxy:**
+
+The most important line is `c.req.raw.headers`. `c.req` is Hono's wrapper around the original HTTP request. `c.req.raw` gives you the raw `Request` object that Cloudflare created when the user's request arrived. Its `.headers` property contains all the original headers (Authorization, Content-Type, User-Agent, etc.). We forward these to the backend so the backend sees exactly what the client sent.
+
+**Test it:**
+
+```bash
+# Restart wrangler dev if it's still running from before
+# Stop it with Ctrl+C, then start again
+wrangler dev
+```
+
+In a separate terminal:
+
+```bash
+# This should return a JSON post from JSONPlaceholder
+curl http://localhost:8787/api/v1/posts/1
+# Response: {"userId":1,"id":1,"title":"sunt aut facere...","body":"quia et suscipit..."}
+
+# Check that our header was added
+curl -v http://localhost:8787/api/v1/posts/1 2>&1 | grep X-EdgeGate
+# Response: < X-EdgeGate: true
+```
+
+You are now proxying requests through EdgeGate to a real backend service. The user hits EdgeGate, EdgeGate hits JSONPlaceholder, and the response flows back.
+
+### Step 7.4: What Is Cloudflare KV? (Full Explanation)
+
+Now we add rate limiting and caching. Both need persistent storage. The only storage available to Workers at the edge is KV.
+
+**KV is a key-value store replicated to all 330+ edge locations.** Here's exactly how it works:
+
+```
+When you write:
+  await c.env.RATE_LIMIT.put("key", "value", { expirationTtl: 60 });
+
+1. Your code (running in a V8 isolate at the Tokyo edge) calls put()
+2. The C++ bridge sends an HTTP request to Cloudflare's KV service
+3. KV stores the key-value pair in Tokyo's local storage
+4. KV starts replicating to other edge locations
+5. After ~60 seconds, the pair exists at all 330+ locations
+
+When you read:
+  const value = await c.env.RATE_LIMIT.get("key");
+
+1. Your code calls get()
+2. The C++ bridge checks local KV storage at the Tokyo edge
+3. If the key was written locally (or has replicated), returns the value
+4. If the key hasn't replicated yet, returns null
+```
+
+**KV has two important properties:**
+
+1. **TTL (Time-To-Live)** — Every KV entry can have an expiration. After N seconds, the entry is automatically deleted. You don't need to clean it up manually.
+
+2. **Eventual consistency** — A write in Tokyo is NOT immediately readable in London. It takes up to 60 seconds to replicate globally. For a single edge location, reads are strongly consistent with writes to that same location.
+
+**How we use KV in EdgeGate:**
+
+```
+Rate limiting:
+  Key format:  ratelimit:{IP address}:{window number}
+  Value:       request count (string)
+  TTL:         same as window size (auto-deletes old windows)
+
+Caching:
+  Key format:  cache:{HTTP method}:{URL path}?{query string}
+  Value:       JSON with { status, headers, body }
+  TTL:         cache duration (auto-expires stale entries)
+```
+
+### Step 7.5: Rate Limiter Middleware
+
+Before we write the middleware, understand the algorithm. We're implementing a **sliding window** rate limiter:
+
+```
+Window size: 10 seconds
+Max requests per window: 10
+
+Time 0s:   Request 1 from IP 1.2.3.4 → count = 1
+Time 3s:   Request 2 from IP 1.2.3.4 → count = 2
+...
+Time 9s:   Request 10 from IP 1.2.3.4 → count = 10
+Time 11s:  Request 11 from IP 1.2.3.4 → count = 10, REJECT (429)
+
+Time 11s:  window = floor(11 / 10) = 1 → new window starts
+           If the 11th request arrives at T=11s, it falls in window 1,
+           which has count 0. But wait — that would allow 10 more requests
+           immediately after the first 10. The "sliding" part handles this:
+```
+
+Actually, this simple window-per-block works well enough for our demo. Let me simplify the explanation.
+
+Create `src/config.ts`:
+
+```typescript
 export const CONFIG = {
-  // Rate limiting: maximum requests per IP per window
   rateLimit: {
     maxRequests: 10,
     windowSeconds: 10,
   },
-
-  // Cache: TTL for cached responses
   cache: {
     defaultTTLSeconds: 60,
-    // Cache only GET requests to these paths
     cacheablePaths: ["/api/v1", "/api/v2"],
   },
-
-  // Backend origin servers (where proxied requests go)
   origins: {
     v1: "https://jsonplaceholder.typicode.com",
     v2: "https://httpbin.org",
@@ -568,37 +882,38 @@ export const CONFIG = {
 };
 ```
 
-### Step 3: Rate Limiter Middleware
-
-This is the most important middleware to understand. It tracks how many requests each IP has made within a time window and blocks requests that exceed the limit.
-
-The algorithm is a **sliding window** stored in KV. For each request, we:
-
-1. Extract the client IP from the request headers (Cloudflare sends `CF-Connecting-IP`)
-2. Create a KV key for this IP's request count in the current window
-3. Read the current count from KV
-4. If the count exceeds the limit, return 429
-5. Otherwise, increment the count and set a TTL on the KV entry
+Create `src/middleware/rate-limiter.ts`:
 
 ```typescript
-// src/middleware/rate-limiter.ts
 import { Context, Next } from "hono";
 import { CONFIG } from "../config";
 
 export async function rateLimiter(c: Context, next: Next) {
+  // 1. Get the client's IP address
+  // Cloudflare sends the real client IP in this header
   const ip = c.req.header("cf-connecting-ip") || "unknown";
+
+  // 2. Calculate which time window we're in
+  // If window is 10 seconds and time is 17 seconds since epoch:
+  //   windowKey = floor(17 / 10) = 1
+  // This creates a new window every 10 seconds
   const now = Math.floor(Date.now() / 1000);
   const windowKey = Math.floor(now / CONFIG.rateLimit.windowSeconds);
 
-  // KV key: ratelimit:{ip}:{window}
+  // 3. Build the KV key
+  // Format: ratelimit:{ip}:{windowNumber}
+  // Example: ratelimit:1.2.3.4:176543
   const key = `ratelimit:${ip}:${windowKey}`;
 
+  // 4. Read the current count from KV
   const kv = c.env.RATE_LIMIT as KVNamespace;
   const currentCount = await kv.get(key);
 
+  // 5. Check if the IP has exceeded the limit
   if (currentCount) {
     const count = parseInt(currentCount, 10);
     if (count >= CONFIG.rateLimit.maxRequests) {
+      // Return 429 Too Many Requests
       return c.json(
         {
           error: "Too Many Requests",
@@ -612,53 +927,126 @@ export async function rateLimiter(c: Context, next: Next) {
     }
   }
 
-  // Increment count (atomic operation)
-  await kv.put(key, String((parseInt(currentCount || "0", 10) || 0) + 1), {
+  // 6. Increment the counter
+  // parseInt returns NaN for empty strings, so we default to 0
+  const newCount = (parseInt(currentCount || "0", 10) || 0) + 1;
+  await kv.put(key, String(newCount), {
     expirationTtl: CONFIG.rateLimit.windowSeconds,
   });
 
+  // 7. Allow the request to proceed
   await next();
 }
 ```
 
-Understanding the sliding window:
+**Understanding the sliding window:**
+
+This is not a perfect sliding window — it creates fixed blocks of time. But it's good enough for our demo:
 
 ```
-Window size: 10 seconds
+Window size: 10 seconds. maxRequests: 10.
 
-Request 1 at T=0s:
-  windowKey = floor(0 / 10) = 0
-  KV key: ratelimit:1.2.3.4:0
-  Count: 1
-  TTL: 10s
+T=0s    Request 1 → windowKey = floor(0/10) = 0 → key: ratelimit:ip:0 → count=1
+T=5s    Request 2 → windowKey = floor(5/10) = 0 → key: ratelimit:ip:0 → count=2
+T=9s    Requests 3-10 → windowKey = 0 → count=10
+T=9.5s  Request 11 → windowKey = 0 → count=10, REJECTED (429)
+T=11s   Request 12 → windowKey = floor(11/10) = 1 → key: ratelimit:ip:1 → count=1 (new window)
 
-Request 2 at T=5s:
-  windowKey = floor(5 / 10) = 0
-  KV key: ratelimit:1.2.3.4:0
-  Count: 2
-
-Request 3 at T=11s:
-  windowKey = floor(11 / 10) = 1
-  KV key: ratelimit:1.2.3.4:1
-  Count: 1 (new window, counter reset)
+The window at TTL=10s for window 0 expires at T=10s, cleaning itself up.
 ```
 
-The TTL on each KV entry ensures automatic cleanup — old windows expire without manual deletion.
-
-Why KV for rate limiting? KV is globally replicated and fast for small reads. It's not as fast as an in-memory counter, but it works across all edge locations. A purely in-memory counter would work only within a single isolate — different requests to different edge locations would have independent counters.
-
-### Step 4: Response Caching Middleware
-
-The cache middleware intercepts GET requests, checks KV for a cached response, and on a hit returns the cached version instead of proxying to the origin.
+**Register the middleware in `src/index.ts`:**
 
 ```typescript
-// src/middleware/cache.ts
+import { Hono } from "hono";
+import { rateLimiter } from "./middleware/rate-limiter";
+
+type Bindings = {
+  RATE_LIMIT: KVNamespace;
+  CACHE: KVNamespace;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// Apply rate limiter to ALL routes
+app.use("*", rateLimiter);
+
+app.get("/", (c) => c.text("Hello Edge"));
+
+app.get("/health", (c) => {
+  return c.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
+
+// Proxy routes (same as before)
+app.get("/api/v1/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v1", "");
+  const targetUrl = `https://jsonplaceholder.typicode.com${targetPath}${url.search}`;
+  const response = await fetch(targetUrl, { headers: c.req.raw.headers });
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+  return new Response(response.body, { status: response.status, headers });
+});
+
+app.get("/api/v2/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v2", "");
+  const targetUrl = `https://httpbin.org${targetPath}${url.search}`;
+  const response = await fetch(targetUrl, { headers: c.req.raw.headers });
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+  return new Response(response.body, { status: response.status, headers });
+});
+
+export default app;
+```
+
+**Key line:** `type Bindings = { RATE_LIMIT: KVNamespace; CACHE: KVNamespace; }`. This tells TypeScript what Cloudflare resources are available. The binding names (`RATE_LIMIT`, `CACHE`) must match exactly what you wrote in `wrangler.toml`. They become properties of `c.env`.
+
+**What `app.use("*", rateLimiter)` does:**
+
+Every request — to `/`, `/health`, `/api/v1/*`, `/api/v2/*` — runs through the rate limiter before reaching the route handler. The `"*"` pattern means "match all paths." You can scope it: `app.use("/api/*", rateLimiter)` would only apply to API routes.
+
+**Test it:**
+
+```bash
+# Need wrangler dev running. If it's running, stop and restart:
+# wrangler dev
+
+# Run this loop — the 11th request should return 429
+for ($i = 0; $i -lt 12; $i++) {
+  $resp = curl -s -o $null -w "%{http_code}" http://localhost:8787/health
+  Write-Output "Request $($i+1): $resp"
+}
+```
+
+Output:
+
+```
+Request 1: 200
+Request 2: 200
+...
+Request 10: 200
+Request 11: 429
+```
+
+The rate limiter stores the count in KV. Each request reads the current count, and when it reaches 10, subsequent requests get 429.
+
+### Step 7.6: Response Caching Middleware
+
+The cache middleware stores GET responses in KV so subsequent requests for the same URL get served from the edge instead of hitting the upstream service.
+
+Create `src/middleware/cache.ts`:
+
+```typescript
 import { Context, Next } from "hono";
 import { CONFIG } from "../config";
 
 function isCacheable(c: Context): boolean {
+  // Only cache GET requests
   if (c.req.method !== "GET") return false;
 
+  // Only cache paths we configured as cacheable
   const url = new URL(c.req.url);
   return CONFIG.cache.cacheablePaths.some((path) =>
     url.pathname.startsWith(path)
@@ -671,6 +1059,7 @@ function cacheKey(c: Context): string {
 }
 
 export async function edgeCache(c: Context, next: Next) {
+  // Step 1: Check if this request should be cached at all
   if (!isCacheable(c)) {
     await next();
     return;
@@ -679,29 +1068,34 @@ export async function edgeCache(c: Context, next: Next) {
   const kv = c.env.CACHE as KVNamespace;
   const key = cacheKey(c);
 
-  // Check cache
+  // Step 2: Try to read from cache
   const cached = await kv.get(key, { type: "text" });
+
   if (cached) {
+    // Cache HIT — return the cached response
     const { status, headers, body } = JSON.parse(cached);
-    headers["X-Cache"] = "HIT";
+    headers["X-Cache"] = "HIT";  // Indicate it came from cache
     return c.newResponse(body, status, headers);
   }
 
-  // Not cached — let the request through
+  // Step 3: Cache MISS — let the request proceed to the route handler
   await next();
 
-  // After the request is handled, cache the response
+  // Step 4: After the route handler runs, we have c.res (the response)
+  // If it was successful, store a copy in cache
   if (c.res && c.res.ok) {
+    // Extract headers from the response
     const headers: Record<string, string> = {};
     c.res.headers.forEach((value, key) => {
       headers[key] = value;
     });
 
-    const cachedValue = JSON.stringify({
-      status: c.res.status,
-      headers,
-      body: await c.res.clone().text(),
-    });
+    // Clone the response body before reading it
+    // A Response body can only be consumed once. Reading it here would
+    // consume it before sending to the client. Cloning creates a copy.
+    const body = await c.res.clone().text();
+
+    const cachedValue = JSON.stringify({ status: c.res.status, headers, body });
 
     await kv.put(key, cachedValue, {
       expirationTtl: CONFIG.cache.defaultTTLSeconds,
@@ -710,230 +1104,180 @@ export async function edgeCache(c: Context, next: Next) {
 }
 ```
 
-The stale-while-revalidate pattern (production addition):
+**Understanding the cache:**
 
-```typescript
-// In the "check cache" section:
-const cached = await kv.getWithMetadata<{ cachedAt: number }>(key);
-if (cached.value) {
-  const { status, headers, body } = JSON.parse(cached.value);
-  const age = Date.now() - (cached.metadata?.cachedAt || 0);
+- **Cache key:** `cache:GET:/api/v1/posts/1?page=2` — includes the full URL with query parameters so different requests get different cached values.
+- **Cache hit:** The stored response (status, headers, body) is parsed from JSON and returned as a new HTTP Response. The `X-Cache: HIT` header tells the client it was served from cache.
+- **Cache miss:** The request continues to the route handler. After the handler runs, the response is stored in KV for future requests.
+- **`c.res.clone().text()`:** This is critical. A Response object's body is a stream. Once you read it, it's gone. `clone()` creates a copy so we can read the body for caching while the original body is sent to the client.
 
-  // If the cache is expired but still useful, serve it and refresh
-  if (age > CONFIG.cache.defaultTTLSeconds * 1000) {
-    headers["X-Cache"] = "STALE";
-    // Fire-and-forget: refresh cache in background
-    ctx.waitUntil(refreshCache(c, kv, key));
-  } else {
-    headers["X-Cache"] = "HIT";
-  }
-
-  return c.newResponse(body, status, headers);
-}
-```
-
-**Important:** We clone the response before reading its body (`c.res.clone().text()`). A Response body can only be consumed once. If we read it to cache it, the original response body is consumed and can't be sent to the client. Cloning creates a copy.
-
-### Step 5: Analytics Logger Middleware
-
-Cloudflare Workers has Analytics Engine — a service for logging structured events that you can query with SQL.
-
-```typescript
-// src/middleware/logger.ts
-import { Context, Next } from "hono";
-
-export async function requestLogger(c: Context, next: Next) {
-  const start = Date.now();
-  const method = c.req.method;
-  const url = c.req.url;
-  const ip = c.req.header("cf-connecting-ip") || "unknown";
-  const userAgent = c.req.header("user-agent") || "unknown";
-
-  await next();
-
-  const status = c.res.status;
-  const latency = Date.now() - start;
-
-  // Write to Analytics Engine
-  c.env.ANALYTICS.writeDataPoint({
-    blobs: [method, url, ip, userAgent],
-    doubles: [latency, status],
-    indexes: [],
-  });
-}
-```
-
-Analytics Engine is append-only and designed for high throughput. You can query it later:
-
-```sql
-SELECT
-  blob1 AS method,
-  blob2 AS url,
-  double1 AS latency
-FROM edgegate_logs
-WHERE timestamp > NOW() - INTERVAL '1' DAY
-ORDER BY double1 DESC
-LIMIT 10
-```
-
-This query finds the slowest requests in the last 24 hours.
-
-### Step 6: Proxy Routes
-
-The proxy routes forward requests to backend services and return the response.
-
-```typescript
-// src/routes/proxy.ts
-import { Hono } from "hono";
-import { CONFIG } from "../config";
-
-const proxy = new Hono();
-
-// GET /api/v1/users — proxies to JSONPlaceholder
-proxy.get("/v1/*", async (c) => {
-  const url = new URL(c.req.url);
-  const targetPath = url.pathname.replace("/api/v1", "");
-  const targetUrl = `${CONFIG.origins.v1}${targetPath}${url.search}`;
-
-  const response = await fetch(targetUrl, {
-    headers: c.req.raw.headers,
-  });
-
-  // Forward the response with added headers
-  const headers = new Headers(response.headers);
-  headers.set("X-EdgeGate", "true");
-  headers.set("X-Upstream", CONFIG.origins.v1);
-
-  return new Response(response.body, {
-    status: response.status,
-    headers,
-  });
-});
-
-// GET /api/v2/anything — proxies to httpbin
-proxy.get("/v2/*", async (c) => {
-  const url = new URL(c.req.url);
-  const targetPath = url.pathname.replace("/api/v2", "");
-  const targetUrl = `${CONFIG.origins.v2}${targetPath}${url.search}`;
-
-  const response = await fetch(targetUrl, {
-    headers: c.req.raw.headers,
-  });
-
-  const headers = new Headers(response.headers);
-  headers.set("X-EdgeGate", "true");
-  headers.set("X-Upstream", CONFIG.origins.v2);
-
-  return new Response(response.body, {
-    status: response.status,
-    headers,
-  });
-});
-
-export { proxy as proxyRoutes };
-```
-
-The `c.req.raw` gives us the original `Request` object. We forward its headers to the upstream service so the backend receives the original request headers (including authentication, content type, etc.).
-
-The `X-EdgeGate` and `X-Upstream` headers let us verify in the response that it went through our gateway.
-
-### Step 7: Health Check Route
-
-```typescript
-// src/routes/health.ts
-import { Hono } from "hono";
-
-const health = new Hono();
-
-health.get("/", async (c) => {
-  // Check KV connectivity by listing namespaces
-  const kvStatus = await checkKV(c);
-  // Check upstream reachability
-  const upstreamStatus = await checkUpstreams(c);
-
-  const allHealthy = kvStatus && upstreamStatus;
-
-  return c.json(
-    {
-      status: allHealthy ? "healthy" : "degraded",
-      timestamp: new Date().toISOString(),
-      location: c.req.header("cf-ray")?.split("-")[1] || "unknown",
-      checks: {
-        kv: kvStatus ? "healthy" : "unhealthy",
-        upstreams: upstreamStatus ? "healthy" : "unhealthy",
-      },
-    },
-    allHealthy ? 200 : 503
-  );
-});
-
-async function checkKV(c: any): Promise<boolean> {
-  try {
-    await c.env.RATE_LIMIT.get("health-check");
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function checkUpstreams(c: any): Promise<boolean> {
-  try {
-    const resp = await fetch("https://jsonplaceholder.typicode.com/posts/1", {
-      signal: AbortSignal.timeout(3000),
-    });
-    return resp.ok;
-  } catch {
-    return false;
-  }
-}
-
-export { health as healthRoutes };
-```
-
-The health check:
-- Verifies KV connectivity (if KV is down, rate limiting and caching won't work)
-- Verifies upstream service reachability
-- Returns the Cloudflare edge location that handled the request (from `cf-ray` header)
-- Returns 200 if everything is healthy, 503 if something is degraded
-
----
-
-## Part 6: Full Code Assembly
-
-Here is the complete `src/index.ts` that ties everything together:
+**Register the cache middleware in `src/index.ts`:**
 
 ```typescript
 import { Hono } from "hono";
 import { rateLimiter } from "./middleware/rate-limiter";
 import { edgeCache } from "./middleware/cache";
-import { requestLogger } from "./middleware/logger";
-import { proxyRoutes } from "./routes/proxy";
-import { healthRoutes } from "./routes/health";
 
 type Bindings = {
   RATE_LIMIT: KVNamespace;
   CACHE: KVNamespace;
-  ANALYTICS: AnalyticsEngineDataset;
 };
 
 const app = new Hono<{ Bindings: Bindings }>();
 
-// Global middleware (order matters — runs in the order registered)
-app.use("*", requestLogger);    // 1. Log every request
-app.use("*", rateLimiter);      // 2. Check rate limit
-app.use("/api/*", edgeCache);    // 3. Check cache only for API routes
+// Middleware order matters: rate limiter runs first, then cache
+app.use("*", rateLimiter);
+app.use("/api/*", edgeCache);  // Only cache API routes
 
-// Route groups
-app.route("/health", healthRoutes);
-app.route("/api", proxyRoutes);
+// Routes (same as before)
+app.get("/", (c) => c.text("Hello Edge"));
+app.get("/health", (c) => {
+  return c.json({ status: "healthy", timestamp: new Date().toISOString() });
+});
+app.get("/api/v1/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v1", "");
+  const targetUrl = `https://jsonplaceholder.typicode.com${targetPath}${url.search}`;
+  const response = await fetch(targetUrl, { headers: c.req.raw.headers });
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+  return new Response(response.body, { status: response.status, headers });
+});
+app.get("/api/v2/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v2", "");
+  const targetUrl = `https://httpbin.org${targetPath}${url.search}`;
+  const response = await fetch(targetUrl, { headers: c.req.raw.headers });
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+  return new Response(response.body, { status: response.status, headers });
+});
 
-// Error handler — catches anything thrown in middleware or routes
+export default app;
+```
+
+**Test the cache:**
+
+```bash
+# First request — cache miss, fetches from JSONPlaceholder
+curl -w "\nTime: %{time_total}s\n" http://localhost:8787/api/v1/posts/1
+# Response should include X-EdgeGate: true but not X-Cache: HIT
+
+# Second request — cache hit, served from KV
+curl -w "\nTime: %{time_total}s\n" http://localhost:8787/api/v1/posts/1
+# Response should include X-Cache: HIT and be noticeably faster
+```
+
+The first request goes to JSONPlaceholder (takes network time). The second request is served from KV at the edge (microseconds).
+
+### Step 7.7: Error Handling and 404
+
+Every production application needs to handle errors gracefully and return meaningful responses when a route doesn't match.
+
+Add these to `src/index.ts`:
+
+```typescript
+// After all routes, before export default app:
+
+// Catches any error thrown in middleware or route handlers
 app.onError((err, c) => {
   console.error(`Unhandled error: ${err.message}`);
   return c.json({ error: "Internal Server Error" }, 500);
 });
 
-// 404 handler — catches anything not matched by any route
+// Catches requests that don't match any registered route
+app.notFound((c) => {
+  return c.json({ error: "Not Found" }, 404);
+});
+```
+
+**Test:**
+
+```bash
+curl http://localhost:8787/nonexistent
+# Response: {"error":"Not Found"} (status 404)
+```
+
+### Step 7.8: Organizing the Code
+
+When your application grows, having everything in one file becomes hard to manage. Let's split the routes into separate files.
+
+Create `src/routes/health.ts`:
+
+```typescript
+import { Hono } from "hono";
+
+const health = new Hono();
+
+health.get("/", (c) => {
+  return c.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+export { health as healthRoutes };
+```
+
+Create `src/routes/proxy.ts`:
+
+```typescript
+import { Hono } from "hono";
+import { CONFIG } from "../config";
+
+const proxy = new Hono();
+
+proxy.get("/v1/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v1", "");
+  const targetUrl = `${CONFIG.origins.v1}${targetPath}${url.search}`;
+  const response = await fetch(targetUrl, { headers: c.req.raw.headers });
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+  return new Response(response.body, { status: response.status, headers });
+});
+
+proxy.get("/v2/*", async (c) => {
+  const url = new URL(c.req.url);
+  const targetPath = url.pathname.replace("/api/v2", "");
+  const targetUrl = `${CONFIG.origins.v2}${targetPath}${url.search}`;
+  const response = await fetch(targetUrl, { headers: c.req.raw.headers });
+  const headers = new Headers(response.headers);
+  headers.set("X-EdgeGate", "true");
+  return new Response(response.body, { status: response.status, headers });
+});
+
+export { proxy as proxyRoutes };
+```
+
+Update `src/index.ts` to use the route files:
+
+```typescript
+import { Hono } from "hono";
+import { rateLimiter } from "./middleware/rate-limiter";
+import { edgeCache } from "./middleware/cache";
+import { healthRoutes } from "./routes/health";
+import { proxyRoutes } from "./routes/proxy";
+
+type Bindings = {
+  RATE_LIMIT: KVNamespace;
+  CACHE: KVNamespace;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.use("*", rateLimiter);
+app.use("/api/*", edgeCache);
+
+// Mount routes under path prefixes
+app.route("/health", healthRoutes);  // /health/* routes
+app.route("/api", proxyRoutes);       // /api/* routes
+
+app.onError((err, c) => {
+  console.error(`Unhandled error: ${err.message}`);
+  return c.json({ error: "Internal Server Error" }, 500);
+});
+
 app.notFound((c) => {
   return c.json({ error: "Not Found" }, 404);
 });
@@ -941,280 +1285,222 @@ app.notFound((c) => {
 export default app;
 ```
 
-Middleware runs in the order they're registered with `app.use()`. The logger runs first (so we capture all requests), then the rate limiter (block early), then the cache (serve cached responses before proxying).
+**What `app.route()` does:** It mounts all routes from a sub-app under a path prefix. `app.route("/health", healthRoutes)` means the routes defined in `healthRoutes` are now accessible under `/health`. If `healthRoutes` defines `GET /`, it becomes `GET /health`.
+
+Now your project structure is:
+
+```
+edgegate/
+├── wrangler.toml
+├── package.json
+├── tsconfig.json
+├── src/
+│   ├── index.ts
+│   ├── config.ts
+│   ├── middleware/
+│   │   ├── rate-limiter.ts
+│   │   └── cache.ts
+│   └── routes/
+│       ├── health.ts
+│       └── proxy.ts
+```
 
 ---
 
-## Part 7: Running Locally
+## Part 8: Running Locally
 
-Before deploying to Cloudflare, you can run the Worker locally using wrangler's dev server.
+Start the local dev server:
 
 ```bash
 wrangler dev
 ```
 
-This starts a local HTTP server (default: `http://localhost:8787`) that simulates the Cloudflare Workers environment. KV is simulated in local storage. Analytics Engine is a no-op in local mode.
-
-Test each feature:
+Test all features:
 
 ```bash
-# Health check
+# 1. Hello
+curl http://localhost:8787
+
+# 2. Health check
 curl http://localhost:8787/health
 
-# Proxy to JSONPlaceholder (cached after first request)
-curl http://localhost:8787/api/v1/posts/1
+# 3. Proxy to JSONPlaceholder (first request — cache miss)
+curl -v http://localhost:8787/api/v1/posts/1 2>&1
 
-# Proxy to httpbin
+# 4. Same request again (cache hit)
+curl -v http://localhost:8787/api/v1/posts/1 2>&1
+
+# 5. Proxy to httpbin
 curl http://localhost:8787/api/v2/anything
 
-# 404
+# 6. 404
 curl http://localhost:8787/nonexistent
 
-# Rate limiting (run this 11 times)
-for i in $(seq 1 11); do
-  curl -s -w "Request $i: HTTP %{http_code}\n" -o /dev/null http://localhost:8787/health
-done
+# 7. Rate limiting (run 11 times, 11th gets 429)
+1..11 | ForEach-Object {
+  $code = curl -s -o $null -w "%{http_code}" http://localhost:8787/health
+  Write-Output "Request $_ : $code"
+}
 ```
 
 ---
 
-## Part 8: Deploying to Cloudflare
+## Part 9: Deploying to Cloudflare
 
 ```bash
 wrangler deploy
 ```
 
-Wrangler uploads your compiled code to Cloudflare's network. Within seconds, your Worker is running at all 330+ edge locations.
+After a few seconds:
 
-```bash
-# Output example
+```
 Successfully published your script to
- https://edgegate.your-subdomain.workers.dev
+ https://edgegate.your-account.workers.dev
 ```
 
-### Custom Domain
+Your Worker is now running at all 330+ Cloudflare edge locations.
 
-To use your own domain:
+Test the same features on the live URL:
 
 ```bash
-wrangler routes add --domain yourdomain.com *.yourdomain.com/api/*
+# Replace with your actual URL
+curl https://edgegate.your-account.workers.dev/health
+curl https://edgegate.your-account.workers.dev/api/v1/posts/1
+curl https://edgegate.your-account.workers.dev/api/v1/posts/1  # cached
 ```
 
-Or in `wrangler.toml`:
+### Custom Domain (Optional)
+
+In `wrangler.toml`:
 
 ```toml
 routes = [
-  { pattern = "yourdomain.com/api/*", zone_name = "yourdomain.com" }
+  { pattern = "api.yourdomain.com/*", zone_name = "yourdomain.com" }
 ]
 ```
 
-### Environment Separation
-
-Create separate environments for production and staging:
-
-```toml
-[env.staging]
-name = "edgegate-staging"
-[[env.staging.kv_namespaces]]
-binding = "RATE_LIMIT"
-id = "staging-kv-id"
-
-[env.production]
-name = "edgegate"
-[[env.production.kv_namespaces]]
-binding = "RATE_LIMIT"
-id = "prod-kv-id"
-```
-
-Deploy to staging first, verify, then deploy to production:
+Then deploy again:
 
 ```bash
-wrangler deploy --env staging
-wrangler deploy --env production
+wrangler deploy
 ```
 
 ---
 
-## Part 9: Benchmarking
+## Part 10: Testing the Edge Benefits
 
-Here's how to verify that the edge deployment actually improves performance.
-
-### Measure Cold vs Warm Start
+### Cold vs Warm Start
 
 ```bash
-# Cold start (first request after a period of inactivity)
-curl -w "\nTime: %{time_total}s\n" -o /dev/null -s https://edgegate.workers.dev/health
+# First request — might be a cold start (~5ms)
+curl -w "\nTotal time: %{time_total}s\n" -o $null -s \
+  https://edgegate.your-account.workers.dev/health
 
-# Warm start (immediately after)
-curl -w "\nTime: %{time_total}s\n" -o /dev/null -s https://edgegate.workers.dev/health
+# Second request — warm start (sub-millisecond at edge)
+curl -w "\nTotal time: %{time_total}s\n" -o $null -s \
+  https://edgegate.your-account.workers.dev/health
 ```
 
-On the first request, the Worker might pay a cold start penalty (~5ms). Subsequent requests should be faster (~1ms regional latency).
+The first request may be slower if a new isolate was created. Subsequent requests reuse the warm isolate.
 
-### Measure Cache Performance
+### Cache Performance
 
 ```bash
-# First request — cache miss
-curl -w "Time: %{time_total}s\n" -o /dev/null -s \
-  https://edgegate.workers.dev/api/v1/posts/1
+# First request — fetches from JSONPlaceholder
+curl -w "\nTime: %{time_total}s\n" -o $null -s \
+  https://edgegate.your-account.workers.dev/api/v1/posts/1
 
-# Second request — cache hit
-curl -w "Time: %{time_total}s\n" -o /dev/null -s \
-  https://edgegate.workers.dev/api/v1/posts/1
+# Second request — served from KV cache at the edge
+curl -w "\nTime: %{time_total}s\n" -o $null -s \
+  https://edgegate.your-account.workers.dev/api/v1/posts/1
 ```
 
-The second request should be noticeably faster because the response is served from KV instead of proxied to the upstream.
+The second request should be significantly faster because the response is read from KV at the same edge location, not fetched from the upstream server.
 
-### Measure Rate Limiting
+### Rate Limiting
 
 ```bash
-# Run 11 requests — the 11th should be blocked
-for i in $(seq 1 11); do
-  curl -s -w "%{http_code}\n" -o /dev/null \
-    https://edgegate.workers.dev/health
-done
-# Output:
-# 200 (x10)
-# 429
-```
-
-### Global Latency Testing
-
-Use a tool like `webpagetest.org` or `catchpoint.com` to test from multiple regions. Or use `curl` from different cloud providers:
-
-```bash
-# From a US East VM
-curl -w "US East: %{time_total}s\n" -o /dev/null -s \
-  https://edgegate.workers.dev/health
-
-# From a Europe West VM (simulate with a VPN or different cloud region)
-curl -w "Europe: %{time_total}s\n" -o /dev/null -s \
-  https://edgegate.workers.dev/health
-```
-
-With Cloudflare Workers, the response time from Europe and US East should be within a few milliseconds of each other — the code runs at the edge nearest to the user, not at a central server.
-
----
-
-## Part 10: Production Considerations
-
-### What EdgeGate Is Missing
-
-EdgeGate is a working API gateway, but for production use, you would add:
-
-1. **Authentication middleware** — Validate JWT tokens, API keys, or OAuth before forwarding requests.
-2. **Request validation** — Validate request bodies against schemas (Zod, JSON Schema) before proxying.
-3. **Circuit breaker** — If an upstream service is failing, stop routing traffic to it and return a cached or degraded response.
-4. **Metrics dashboard** — Cloudflare's Analytics Engine data can be visualized with Grafana or a custom dashboard.
-5. **Graceful degradation** — When KV is slow or failing, skip caching instead of failing the request.
-
-### KV Limitations for Production
-
-KV is not ideal for high-frequency rate limiting in production:
-
-- KV has eventual consistency (up to 60 seconds for strong consistency)
-- KV throughput is limited per namespace (1000 reads/second per namespace on the free plan)
-- For production rate limiting, consider Durable Objects (strongly consistent, single-node coordination) or a dedicated rate limiting service
-
-EdgeGate's KV-based rate limiter works for demonstration and low-traffic use cases. For production, replace it with Durable Objects:
-
-```typescript
-// DO-based rate limiter (sketch)
-export class RateLimiter extends DurableObject {
-  state: Map<string, number[]>;
-
-  async request(ip: string): Promise<boolean> {
-    const now = Date.now();
-    const window = 10_000; // 10 seconds
-
-    let timestamps = this.state.get(ip) || [];
-    timestamps = timestamps.filter(t => now - t < window);
-
-    if (timestamps.length >= 10) {
-      return false; // blocked
-    }
-
-    timestamps.push(now);
-    this.state.set(ip, timestamps);
-    return true; // allowed
-  }
+# Hit it 11 times — the 11th gets blocked
+1..11 | ForEach-Object {
+  $code = curl -s -o $null -w "%{http_code}" \
+    https://edgegate.your-account.workers.dev/health
+  Write-Output "Request $_ : $code"
 }
 ```
 
-### Caching Strategy: What to Cache and What Not To
-
-EdgeGate caches every GET response to `/api/v1/*` and `/api/v2/*`. In production:
-
-- **Cache public responses** (public data that doesn't change per user)
-- **Never cache private data** (user-specific responses, authentication errors)
-- **Use short TTLs** for dynamic data (seconds to minutes)
-- **Use long TTLs** for static data (hours to days)
-- **Skip caching for large bodies** (KV has a 25MB limit per value)
-
 ---
 
-## Part 11: Understanding What You Built
+## Part 11: What You Built (Request Trace)
 
-You now have an API gateway running on 330+ servers worldwide. Let's trace what happens on every request:
+Here's the complete path of a single request through EdgeGate:
 
 ```
-1. User sends HTTP request to edgegate.workers.dev
+1. You visit https://edgegate.your-account.workers.dev/api/v1/posts/1
 
 2. DNS resolves to the nearest Cloudflare edge location
-   (Tokyo if the user is in Japan, London if in the UK, etc.)
+   (Tokyo if you're in Japan, Frankfurt if in Germany, etc.)
 
-3. The edge location receives the request and looks up:
-   "Is there a Worker deployed at this route?"
-   → Yes, edgegate.workers.dev has a Worker
+3. The edge location receives the request and finds:
+   "There is a Worker at edgegate.your-account.workers.dev"
 
-4. The edge location checks for a warm V8 isolate:
-   → Warm: uses the cached isolate (code already compiled)
-   → Cold: creates a new isolate, compiles the code (~5ms)
+4. Cloudflare finds (or creates) a V8 isolate for your Worker
+   → Creates isolate (~5ms if cold)
+   → Your entire bundle is already compiled and in memory
 
-5. The Worker's fetch handler receives the request:
-   Hono's routing trie matches the path to a handler
+5. The Worker's fetch handler receives the request
+   Hono's trie matches: /api/v1/posts/1 → hits the proxy route
 
 6. Middleware runs in order:
-   6a. Logger: records start time, method, URL, IP
-   6b. Rate Limiter: reads KV entry for this IP's window
-       → If count exceeds limit, returns 429 immediately
-       → Otherwise, increments counter and continues
-   6c. Cache: checks KV for a cached response
-       → If cache HIT, returns cached response immediately
-       → If cache MISS, continues to the route handler
+   a. Rate limiter reads KV → "3 requests in current window" → allowed
+   b. Cache checks KV → "cache:GET:/api/v1/posts/1" → not found (miss)
 
 7. Route handler runs:
-   → Proxy: fetches from upstream (JSONPlaceholder or httpbin)
-   → Health: returns health status
+   fetch("https://jsonplaceholder.typicode.com/posts/1")
+   → This C++ function opens an HTTP connection to JSONPlaceholder
+   → Sends the request
+   → Gets the response
 
 8. Response flows back through middleware:
-   Cache middleware: if the response was cacheable, stores it in KV
-   Logger: records status code, latency, writes to Analytics Engine
+   Cache middleware: stores the response in KV with 60s TTL
+   Rate limiter: already ran (before the route)
 
 9. The Response is returned to the edge location
 
-10. The edge location sends the response to the user
-```
+10. The edge location sends the response to your browser
 
-Total time from user request to user response: typically 10-50ms, depending on cache hit status and upstream latency.
+Total time: ~30-100ms (mostly the upstream fetch)
+              → Next request: ~5-10ms (from cache at the edge)
+
+On a subsequent request for the same URL:
+  1-4: Same as above
+  5:   Hono matches the route
+  6a:  Rate limiter checks → "5 requests" → allowed
+  6b:  Cache checks KV → "cache:GET:/api/v1/posts/1" → FOUND
+  7:   Returns cached response immediately. No upstream fetch.
+  8-10: Same as above
+  
+  Total time: ~5-10ms (all at the edge, no network to upstream)
+```
 
 ---
 
 ## Key Takeaways
 
-**The edge model** is not about "no servers." It's about code that runs at 330+ locations worldwide, in stateless V8 isolates that are created per request and destroyed when the request ends. There is no `app.listen()` because you aren't starting a process — you're exporting a function for the platform to call.
+**Edge computing** runs your code on 330+ servers worldwide. Users are always served by the closest location. There is no `app.listen()` — you export a function, the platform calls it.
 
-**V8 isolates** are sandboxed JavaScript execution environments within a single V8 process. Each isolate has its own heap, its own garbage collector, and cannot access other isolates' memory. They're stateless, short-lived, and constrained — no file system, no network sockets, limited CPU time. These constraints enable the platform to scale to zero, start in milliseconds, and run code from multiple customers on the same machine safely.
+**V8 isolates** are sandboxed JavaScript execution environments. They're created per request, have no file system access, and can only interact with the outside world through bindings (fetch, KV, R2).
 
-**Hono** is a framework designed for this environment. It provides Express-like routing and middleware but compiles routes into a trie (O(path-length) matching instead of O(n)), uses the platform's native Request/Response objects, bundles to 15KB instead of 600KB, and runs on any runtime that supports the Web API standard.
+**Cloudflare KV** is a globally replicated key-value store. It persists data across requests at the edge. Operations are `get()`, `put()`, and `delete()` with optional TTL. Eventually consistent.
 
-**EdgeGate** is a real API gateway that uses Hono's routing, middleware, and context to proxy requests, rate-limit per IP, cache responses, and log analytics — all running at the edge. The KV-based rate limiter and cache demonstrate the tradeoffs of edge storage: globally replicated but eventually consistent.
+**Hono** is a framework that compiles routes into a trie for O(path-length) matching. It generates a 15KB bundle, wraps the platform's native Request/Response objects, and provides middleware, route grouping, error handling, and adapters for all runtimes.
+
+**EdgeGate** is an API gateway running at the edge. It proxies requests to backend services, rate-limits per IP using KV, caches responses at the edge using KV, and demonstrates the core patterns of edge computing.
 
 ### Resources
 
 - [Hono Documentation](https://hono.dev/)
 - [Cloudflare Workers Documentation](https://developers.cloudflare.com/workers/)
-- [WinterCG Specification](https://wintercg.org/) — the web-interoperable runtime standard that Hono targets
-- [Wrangler CLI Reference](https://developers.cloudflare.com/workers/wrangler/)
 - [Cloudflare KV Documentation](https://developers.cloudflare.com/kv/)
-- [Cloudflare Analytics Engine](https://developers.cloudflare.com/analytics/analytics-engine/)
+- [Wrangler CLI Reference](https://developers.cloudflare.com/workers/wrangler/)
+- [JSONPlaceholder API](https://jsonplaceholder.typicode.com/)
+- [httpbin](https://httpbin.org/)
