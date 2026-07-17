@@ -107,65 +107,99 @@ The radix tree also supports wildcards (`/users/*`), parameters (`/users/:id`), 
 
 ### The Serializer: fast-json-stringify
 
-When you call `reply.send({ user: { name: "Alice", ... } })`, Express calls `JSON.stringify()` on the object. `JSON.stringify` is a generic C++ function that walks the object at runtime, checking each property's type, handling circular references, and building the JSON string character by character.
+When you call `reply.send({ user: { name: "Alice" } })`, Express calls `JSON.stringify()` on the object. `JSON.stringify` is a generic C++ function that walks the object at runtime, checking each property's type, handling circular references, and building the JSON string character by character.
 
-Fastify pre-compiles serialization functions. If you provide a JSON Schema for the response:
+Fastify pre-compiles serialization functions. You attach a **response schema** to a route, and Fastify generates an optimized serializer at startup:
 
 ```ts
-reply.schema = {
-  response: {
-    200: {
-      type: "object",
-      properties: {
-        user: {
+import Fastify from "fastify";
+
+const app = Fastify();
+
+app.get<{ Reply: { user: { id: number; name: string; email: string } } }>(
+  "/users/:id",
+  {
+    schema: {
+      response: {
+        200: {
           type: "object",
           properties: {
-            id: { type: "integer" },
-            name: { type: "string" },
-            email: { type: "string" },
+            user: {
+              type: "object",
+              properties: {
+                id: { type: "integer" },
+                name: { type: "string" },
+                email: { type: "string" },
+              },
+            },
           },
         },
       },
     },
   },
-};
+  async (request, reply) => {
+    const user = await db.findUser(request.params.id);
+    return { user };  // Fastify serializes this using the compiled function
+  }
+);
 ```
 
-Fastify generates a JavaScript function at startup that looks like:
+The `schema` property is a **route option** — the second argument to `app.get()`, `app.post()`, etc. Inside it, `response` describes what the response should look like for each status code. The key `200` is the status code; its value is a JSON Schema that describes the response body.
+
+When the server starts, Fastify reads all route schemas and compiles a serializer function for each one. For the schema above, it generates roughly:
 
 ```ts
-function serialize(data) {
+// Generated at startup, used at runtime — no JSON.stringify() call
+function serializeReply200(data) {
   return `{"user":{"id":${data.user.id},"name":"${data.user.name}","email":"${data.user.email}"}}`;
 }
-// Called directly — no type checks, no property walking at runtime
 ```
 
 This generated function:
-- Accesses properties directly by name (no reflection)
-- Knows every property's type at compile time (no type checking)
-- Concatenates strings directly (no intermediate object representation)
+- Accesses properties directly by name — no property walking
+- Knows every property's type at compile time — no type checks at runtime
+- Concatenates strings directly — no intermediate representation
 - Is ~10x faster than `JSON.stringify` for large objects
 
-Without a response schema, Fastify falls back to `JSON.stringify`. The benefit comes from providing schemas — which you should always do for production endpoints.
+**Without a response schema,** Fastify falls back to `JSON.stringify`. The performance benefit only kicks in when you provide schemas. In production, you should provide response schemas for every endpoint — but in practice, most teams only validate request bodies and use TypeBox schemas for response types (covered in Part 5).
 
 ### The Validator: Ajv (Another JSON Validator)
 
-Fastify uses Ajv for request validation. Like serialization, Ajv compiles JSON Schema into JavaScript functions at startup:
+Fastify uses Ajv for request validation. Like the serializer, Ajv compiles JSON Schema into JavaScript functions at startup. You attach a **body schema** as a route option, just like the response schema:
 
 ```ts
-// Schema provided at route registration
-{
-  body: {
-    type: "object",
-    required: ["email", "password"],
-    properties: {
-      email: { type: "string", format: "email" },
-      password: { type: "string", minLength: 8 },
+import Fastify from "fastify";
+import { Type } from "@sinclair/typebox";  // optional, TypeBox makes this cleaner
+
+const app = Fastify();
+
+app.post(
+  "/auth/login",
+  {
+    schema: {
+      body: {
+        type: "object",
+        required: ["email", "password"],
+        properties: {
+          email: { type: "string", format: "email" },
+          password: { type: "string", minLength: 8 },
+        },
+      },
     },
   },
-}
+  async (request, reply) => {
+    // If we reach here, body.email and body.password are VALID
+    // Fastify already rejected invalid requests with 400
+    const { email, password } = request.body;
+    // ...
+  }
+);
+```
 
-// Ajv compiles this into roughly:
+The `schema.body` key tells Fastify: "validate the request body against this JSON Schema before the handler runs." If the body is missing `email`, or `password` is too short, Fastify returns a 400 response immediately — your handler never executes.
+
+Ajv compiles this schema at startup into roughly: 
+```ts
 function validate(data) {
   if (typeof data !== "object") return false;
   if (typeof data.email !== "string") return false;
