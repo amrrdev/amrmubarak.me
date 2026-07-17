@@ -211,12 +211,10 @@ src/
 │   │   ├── database.module.ts
 │   │   ├── database.service.ts
 │   │   └── drizzle.schema.ts
-│   ├── tenants/
-│   │   ├── tenant.module.ts
-│   │   ├── tenant.service.ts
-│   │   ├── tenant.guard.ts
-│   │   ├── tenant.decorator.ts
-│   │   └── tenant.schema.ts
+│   ├── tenant/
+│   │   ├── tenant.guard.ts      # Global request guard
+│   │   ├── tenant.decorator.ts   # @Tenant() param decorator
+│   │   └── tenant.module.ts     # Global module, provides guard + decorator
 │   ├── auth/
 │   │   ├── auth.module.ts
 │   │   ├── auth.service.ts
@@ -224,6 +222,11 @@ src/
 │   │   └── current-user.decorator.ts
 │   └── common.module.ts
 ├── modules/                     # Business logic — one folder per domain
+│   ├── tenants/
+│   │   ├── tenants.module.ts
+│   │   ├── tenants.service.ts   # Resolve + CRUD for tenants
+│   │   ├── tenants.controller.ts
+│   │   └── tenant.schema.ts     # Drizzle table definition
 │   ├── wallets/
 │   │   ├── wallets.module.ts
 │   │   ├── wallets.controller.ts
@@ -491,6 +494,7 @@ The `drizzle.schema.ts` file re-exports all schemas from every module:
 
 ```ts
 // src/common/database/drizzle.schema.ts
+export * from "../../modules/tenants/tenant.schema";
 export * from "../../modules/wallets/wallets.schema";
 export * from "../../modules/transactions/transactions.schema";
 // Each new module's schema gets added here
@@ -553,12 +557,14 @@ The critical line: `NestFactory.create<NestFastifyApplication>(AppModule, new Fa
 
 ## Part 5: The Multi-Tenancy Module
 
-This is the most important infrastructure module. It ensures every request has a tenant context, and every database query filters by that tenant.
+Multi-tenancy touches two layers of the application. The **infrastructure** layer ensures every request has a tenant context (guard + decorator). The **business** layer provides tenant CRUD and resolution (service + schema + controller).
 
-### 5.1 Tenant Schema
+We keep the infrastructure in `common/tenant/` and the business logic in `modules/tenants/`.
+
+### 5.1 Tenant Schema (modules/tenants/)
 
 ```ts
-// src/common/tenants/tenant.schema.ts
+// src/modules/tenants/tenant.schema.ts
 import { pgTable, text, timestamp } from "drizzle-orm/pg-core";
 
 export const tenants = pgTable("tenants", {
@@ -570,15 +576,17 @@ export const tenants = pgTable("tenants", {
 });
 ```
 
-Each tenant is a row. All other tables reference `tenant_id` as a foreign key.
+Each tenant is a row. All other tables reference `tenant_id` as a foreign key. The schema lives in `modules/tenants/` because it defines a business entity, not infrastructure.
 
-### 5.2 Tenant Service
+### 5.2 Tenant Service (modules/tenants/)
+
+The service resolves tenants for the guard and provides CRUD for tenant management.
 
 ```ts
-// src/common/tenants/tenant.service.ts
+// src/modules/tenants/tenants.service.ts
 import { Injectable, NotFoundException } from "@nestjs/common";
 import { eq } from "drizzle-orm";
-import { DrizzleService } from "../database/database.service";
+import { DrizzleService } from "../../common/database/database.service";
 import { tenants } from "./tenant.schema";
 
 export interface TenantContext {
@@ -588,27 +596,8 @@ export interface TenantContext {
 }
 
 @Injectable()
-export class TenantService {
+export class TenantsService {
   constructor(private readonly drizzle: DrizzleService) {}
-
-  async resolveByApiKey(apiKey: string): Promise<TenantContext | null> {
-    // In production, look up the api key in a tenant_api_keys table
-    // For now, we decode a simple format: "tenant_id:secret"
-    const parts = apiKey.split(":");
-    if (parts.length !== 2) return null;
-
-    const [tenantId] = parts;
-    const result = await this.drizzle.db
-      .select()
-      .from(tenants)
-      .where(eq(tenants.id, tenantId))
-      .limit(1);
-
-    const tenant = result[0];
-    if (!tenant) return null;
-
-    return { id: tenant.id, name: tenant.name, slug: tenant.slug };
-  }
 
   async resolveBySlug(slug: string): Promise<TenantContext | null> {
     const result = await this.drizzle.db
@@ -616,26 +605,33 @@ export class TenantService {
       .from(tenants)
       .where(eq(tenants.slug, slug))
       .limit(1);
+    return result[0] || null;
+  }
 
-    const tenant = result[0];
-    if (!tenant) return null;
-
-    return { id: tenant.id, name: tenant.name, slug: tenant.slug };
+  async resolveByApiKey(apiKey: string): Promise<TenantContext | null> {
+    const parts = apiKey.split(":");
+    if (parts.length !== 2) return null;
+    const [tenantId] = parts;
+    const result = await this.drizzle.db
+      .select()
+      .from(tenants)
+      .where(eq(tenants.id, tenantId))
+      .limit(1);
+    return result[0] || null;
   }
 }
 ```
 
-### 5.3 Tenant Guard
+### 5.3 Tenant Guard (common/tenant/)
 
-The guard runs before every route. It extracts the tenant from the request and attaches it to the request context. If the tenant can't be resolved, it returns 401.
+The guard runs before every route. It extracts the tenant from the request headers and attaches it to the request context. If the tenant can't be resolved, it returns 401.
 
 ```ts
-// src/common/tenants/tenant.guard.ts
+// src/common/tenant/tenant.guard.ts
 import { Injectable, CanActivate, ExecutionContext, UnauthorizedException } from "@nestjs/common";
 import { FastifyRequest } from "fastify";
-import { TenantService, TenantContext } from "./tenant.service";
+import { TenantsService, TenantContext } from "../../modules/tenants/tenants.service";
 
-// Extend the Fastify request to include tenant info
 declare module "fastify" {
   interface FastifyRequest {
     tenant: TenantContext;
@@ -644,7 +640,7 @@ declare module "fastify" {
 
 @Injectable()
 export class TenantGuard implements CanActivate {
-  constructor(private readonly tenantService: TenantService) {}
+  constructor(private readonly tenantsService: TenantsService) {}
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<FastifyRequest>();
@@ -652,33 +648,23 @@ export class TenantGuard implements CanActivate {
     // Strategy 1: Header-based (X-Tenant-Slug)
     const slug = request.headers["x-tenant-slug"] as string;
     if (slug) {
-      const tenant = await this.tenantService.resolveBySlug(slug);
-      if (tenant) {
-        request.tenant = tenant;
-        return true;
-      }
+      const tenant = await this.tenantsService.resolveBySlug(slug);
+      if (tenant) { request.tenant = tenant; return true; }
     }
 
     // Strategy 2: API Key header
     const apiKey = request.headers["x-api-key"] as string;
     if (apiKey) {
-      const tenant = await this.tenantService.resolveByApiKey(apiKey);
-      if (tenant) {
-        request.tenant = tenant;
-        return true;
-      }
+      const tenant = await this.tenantsService.resolveByApiKey(apiKey);
+      if (tenant) { request.tenant = tenant; return true; }
     }
 
-    // Strategy 3: Subdomain (useful for browser-based access)
-    // e.g., acme.api.myapp.com
+    // Strategy 3: Subdomain (e.g., acme.api.myapp.com)
     const host = request.headers["host"] || "";
     const subdomain = host.split(".")[0];
     if (subdomain && subdomain !== "api") {
-      const tenant = await this.tenantService.resolveBySlug(subdomain);
-      if (tenant) {
-        request.tenant = tenant;
-        return true;
-      }
+      const tenant = await this.tenantsService.resolveBySlug(subdomain);
+      if (tenant) { request.tenant = tenant; return true; }
     }
 
     throw new UnauthorizedException("Tenant not found. Provide X-Tenant-Slug or X-Api-Key header.");
@@ -691,14 +677,15 @@ Three resolution strategies, checked in order:
 2. **API Key** (`X-Api-Key`) — standard for programmatic access
 3. **Subdomain** — for browser-based apps
 
-### 5.4 Tenant Decorator
+### 5.4 Tenant Decorator (common/tenant/)
 
 Instead of reaching into `request.tenant` manually in every controller, we create a decorator:
 
 ```ts
-// src/common/tenants/tenant.decorator.ts
+// src/common/tenant/tenant.decorator.ts
 import { createParamDecorator, ExecutionContext } from "@nestjs/common";
 import { FastifyRequest } from "fastify";
+import { TenantContext } from "../../modules/tenants/tenants.service";
 
 export const Tenant = createParamDecorator(
   (data: unknown, ctx: ExecutionContext): TenantContext => {
@@ -714,27 +701,48 @@ Usage in a controller:
 @Get("wallets")
 async getAll(@Tenant() tenant: TenantContext) {
   return this.walletsService.findAll(tenant.id);
-  // tenant.id is automatically available. No manual header parsing.
 }
 ```
 
-### 5.5 Tenant Module
+### 5.5 Infrastructure Module (common/tenant/)
+
+Provides the guard and decorator globally. The guard's dependency on `TenantsService` is resolved by NestJS DI — when `TenantsModule` is imported in `AppModule`, the service becomes available to all injectors.
 
 ```ts
-// src/common/tenants/tenant.module.ts
+// src/common/tenant/tenant.module.ts
 import { Global, Module } from "@nestjs/common";
-import { TenantService } from "./tenant.service";
 import { TenantGuard } from "./tenant.guard";
+import { Tenant } from "./tenant.decorator";
 
 @Global()
 @Module({
-  providers: [TenantService, TenantGuard],
-  exports: [TenantService, TenantGuard],
+  providers: [TenantGuard, Tenant],
+  exports: [TenantGuard, Tenant],
 })
-export class TenantModule {}
+export class TenantInfraModule {}
 ```
 
-`@Global()` so every module can inject `TenantService` without importing `TenantModule`.
+### 5.6 Business Module (modules/tenants/)
+
+```ts
+// src/modules/tenants/tenants.module.ts
+import { Module } from "@nestjs/common";
+import { TenantsService } from "./tenants.service";
+
+@Module({
+  providers: [TenantsService],
+  exports: [TenantsService],
+})
+export class TenantsModule {}
+```
+
+### Why the split?
+
+The guard and decorator are **infrastructure** — they process every HTTP request, extract context, inject it into the handler. They live in `common/` because they're cross-cutting concerns used by every module.
+
+The schema, service, and controller are **business logic** — they define what a tenant IS and how to manage them. They live in `modules/tenants/` because they're a domain like any other.
+
+The guard imports `TenantsService` from the business module. This is an accepted exception to the "common never imports modules" rule — the guard needs domain knowledge to resolve who the tenant is. NestJS's DI makes this work regardless of where the service is defined.
 
 ---
 
@@ -927,7 +935,8 @@ export class HealthModule {}
 import { Module } from "@nestjs/common";
 import { ConfigModule as NestConfigModule } from "@nestjs/config";
 import { DatabaseModule } from "./common/database/database.module";
-import { TenantModule } from "./common/tenants/tenant.module";
+import { TenantInfraModule } from "./common/tenant/tenant.module";
+import { TenantsModule } from "./modules/tenants/tenants.module";
 import { AuthModule } from "./common/auth/auth.module";
 import { HealthModule } from "./modules/health/health.module";
 import { APP_GUARD } from "@nestjs/core";
@@ -936,14 +945,15 @@ import { APP_GUARD } from "@nestjs/core";
   imports: [
     NestConfigModule.forRoot({ isGlobal: true }),  // Loads .env — no validation here
     DatabaseModule,
-    TenantModule,
+    TenantInfraModule,
+    TenantsModule,
     AuthModule,
     HealthModule,
   ],
   providers: [
     {
       provide: APP_GUARD,
-      useClass: TenantGuard,
+      useClass: TenantGuard,  // From TenantInfraModule
     },
     {
       provide: APP_GUARD,
@@ -976,7 +986,7 @@ if (isPublic) return true;  // Skip auth for public routes
 Now we need our first actual database tables. Let's create the tenant schema and run the first migration.
 
 ```ts
-// src/common/tenants/tenant.schema.ts
+// src/modules/tenants/tenant.schema.ts
 import { pgTable, text, timestamp } from "drizzle-orm/pg-core";
 
 export const tenants = pgTable("tenants", {
@@ -1103,18 +1113,21 @@ wallet-api/
     │   │   ├── database.module.ts    # Global Drizzle client
     │   │   ├── database.service.ts   # Drizzle wrapper with Pool
     │   │   └── drizzle.schema.ts     # Re-exports all module schemas
-    │   ├── tenants/
-    │   │   ├── tenant.module.ts      # Multi-tenancy infrastructure
-    │   │   ├── tenant.service.ts     # Resolve tenant from header/key/subdomain
-    │   │   ├── tenant.guard.ts       # Global tenant guard
-    │   │   ├── tenant.decorator.ts   # @Tenant() param decorator
-    │   │   └── tenant.schema.ts      # Tenants table definition
+    │   ├── tenant/
+    │   │   ├── tenant.module.ts      # Global infrastructure module
+    │   │   ├── tenant.guard.ts       # Resolves tenant from request
+    │   │   └── tenant.decorator.ts   # @Tenant() param decorator
     │   └── auth/
     │       ├── auth.module.ts        # JWT auth infrastructure
     │       ├── auth.service.ts       # Sign + verify JWT
     │       ├── jwt.guard.ts          # Global auth guard
     │       └── current-user.decorator.ts  # @CurrentUser() param decorator
     └── modules/
+        ├── tenants/
+        │   ├── tenants.module.ts     # Tenant CRUD + resolution
+        │   ├── tenants.service.ts
+        │   ├── tenants.controller.ts
+        │   └── tenant.schema.ts      # Drizzle table definition
         └── health/
             ├── health.module.ts
             └── health.controller.ts  # Database health check
