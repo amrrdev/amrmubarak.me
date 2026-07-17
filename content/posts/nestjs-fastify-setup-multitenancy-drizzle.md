@@ -203,22 +203,25 @@ The NestJS documentation shows a todo-app structure where everything is in `src/
 src/
 ├── main.ts                      # Entry point, FastifyAdapter bootstrap
 ├── app.module.ts                # Root module — imports everything
+├── config/                      # Per-domain config files (registerAs)
+│   ├── database.config.ts
+│   └── jwt.config.ts
 ├── common/                      # Shared infrastructure (not business logic)
 │   ├── database/
 │   │   ├── database.module.ts
-│   │   └── database.service.ts
+│   │   ├── database.service.ts
+│   │   └── drizzle.schema.ts
 │   ├── tenants/
 │   │   ├── tenant.module.ts
 │   │   ├── tenant.service.ts
 │   │   ├── tenant.guard.ts
-│   │   └── tenant.decorator.ts
+│   │   ├── tenant.decorator.ts
+│   │   └── tenant.schema.ts
 │   ├── auth/
 │   │   ├── auth.module.ts
 │   │   ├── auth.service.ts
 │   │   ├── jwt.guard.ts
 │   │   └── current-user.decorator.ts
-│   ├── config/
-│   │   └── config.module.ts
 │   └── common.module.ts
 ├── modules/                     # Business logic — one folder per domain
 │   ├── wallets/
@@ -356,35 +359,41 @@ pnpm add -D drizzle-kit @types/node
 ### 4.3 Environment Configuration
 
 ```bash
-pnpm add @nestjs/config joi
+pnpm add @nestjs/config
 ```
 
-NestJS config module loads environment variables. We use Joi to validate that required variables exist at startup — better to fail fast than to crash later with a confusing error.
+NestJS config module loads `.env` into `process.env`. We use `registerAs()` to create typed, per-domain config namespaces that each module loads independently.
 
 ```ts
-// src/common/config/config.module.ts
-import { Module } from "@nestjs/common";
-import { ConfigModule as NestConfigModule } from "@nestjs/config";
-import * as Joi from "joi";
+// src/config/database.config.ts
+import { registerAs } from "@nestjs/config";
 
-@Module({
-  imports: [
-    NestConfigModule.forRoot({
-      isGlobal: true,  // Available in all modules without re-importing
-      validationSchema: Joi.object({
-        NODE_ENV: Joi.string().valid("development", "production", "test").default("development"),
-        PORT: Joi.number().default(3000),
-        DATABASE_URL: Joi.string().required().description("PostgreSQL connection string"),
-        JWT_SECRET: Joi.string().required().min(32).description("JWT signing key"),
-        JWT_EXPIRATION: Joi.string().default("15m"),
-      }),
-    }),
-  ],
-})
-export class ConfigModule {}
+export default registerAs("database", () => {
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error("DATABASE_URL is required");
+  return { url };
+});
 ```
 
-The `validationSchema` runs when the server starts. If `DATABASE_URL` is missing, NestJS throws an error before any request is served. This prevents deploying a misconfigured app to production.
+```ts
+// src/config/jwt.config.ts
+import { registerAs } from "@nestjs/config";
+
+export default registerAs("jwt", () => {
+  const secret = process.env.JWT_SECRET;
+  if (!secret || secret.length < 32) {
+    throw new Error("JWT_SECRET is required and must be at least 32 characters");
+  }
+  return {
+    secret,
+    expiration: process.env.JWT_EXPIRATION || "15m",
+  };
+});
+```
+
+Each file validates its own variables and throws at startup if something is missing. No central file knows about everything — if you remove the Auth module, `jwt.config.ts` is never loaded.
+
+Each module uses `ConfigModule.forFeature()` to load only its namespace (shown in the database and auth sections below).
 
 ### 4.4 Docker Compose for Postgres
 
@@ -448,22 +457,26 @@ We create a NestJS provider that wraps the Drizzle client. This lets us inject `
 
 ```ts
 // src/common/database/database.service.ts
-import { Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
-import { ConfigService } from "@nestjs/config";
+import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
+import { ConfigType } from "@nestjs/config";
 import { drizzle, NodePgDatabase } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
-import * as schema from "./drizzle.schema";  // We'll create this next
+import databaseConfig from "../../config/database.config";
+import * as schema from "./drizzle.schema";
 
 @Injectable()
 export class DrizzleService implements OnModuleInit, OnModuleDestroy {
   public db: NodePgDatabase<typeof schema>;
   private pool: Pool;
 
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    @Inject(databaseConfig.KEY)
+    private readonly dbConfig: ConfigType<typeof databaseConfig>,
+  ) {}
 
   async onModuleInit() {
     this.pool = new Pool({
-      connectionString: this.configService.get<string>("DATABASE_URL"),
+      connectionString: this.dbConfig.url,
     });
     this.db = drizzle(this.pool, { schema });
   }
@@ -488,10 +501,13 @@ This single-import approach is the Drizzle recommended pattern. When you add a n
 ```ts
 // src/common/database/database.module.ts
 import { Global, Module } from "@nestjs/common";
+import { ConfigModule } from "@nestjs/config";
+import databaseConfig from "../../config/database.config";
 import { DrizzleService } from "./database.service";
 
 @Global()
 @Module({
+  imports: [ConfigModule.forFeature(databaseConfig)],
   providers: [DrizzleService],
   exports: [DrizzleService],
 })
@@ -728,9 +744,10 @@ export class TenantModule {}
 
 ```ts
 // src/common/auth/auth.service.ts
-import { Injectable, UnauthorizedException } from "@nestjs/common";
+import { Inject, Injectable, UnauthorizedException } from "@nestjs/common";
+import { ConfigType } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
-import { ConfigService } from "@nestjs/config";
+import jwtConfig from "../../config/jwt.config";
 
 export interface JwtPayload {
   sub: string;      // User ID
@@ -742,8 +759,12 @@ export interface JwtPayload {
 export class AuthService {
   constructor(
     private readonly jwtService: JwtService,
-    private readonly configService: ConfigService,
-  ) {}
+    @Inject(jwtConfig.KEY)
+    private readonly config: ConfigType<typeof jwtConfig>,
+  ) {
+    // config.secret — typed, only JWT fields
+    // config.expiration — typed, only JWT fields
+  }
 
   async login(userId: string, tenantId: string, role: string): Promise<string> {
     const payload: JwtPayload = { sub: userId, tenantId, role };
@@ -829,22 +850,21 @@ async getProfile(
 ```ts
 // src/common/auth/auth.module.ts
 import { Global, Module } from "@nestjs/common";
+import { ConfigModule } from "@nestjs/config";
 import { JwtModule } from "@nestjs/jwt";
-import { ConfigModule, ConfigService } from "@nestjs/config";
+import jwtConfig from "../../config/jwt.config";
 import { AuthService } from "./auth.service";
 import { JwtGuard } from "./jwt.guard";
 
 @Global()
 @Module({
   imports: [
+    ConfigModule.forFeature(jwtConfig),
     JwtModule.registerAsync({
-      imports: [ConfigModule],
-      inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        secret: config.get<string>("JWT_SECRET"),
-        signOptions: {
-          expiresIn: config.get<string>("JWT_EXPIRATION") || "15m",
-        },
+      inject: [jwtConfig.KEY],
+      useFactory: (config: { secret: string; expiration: string }) => ({
+        secret: config.secret,
+        signOptions: { expiresIn: config.expiration },
       }),
     }),
   ],
@@ -905,7 +925,7 @@ export class HealthModule {}
 ```ts
 // src/app.module.ts
 import { Module } from "@nestjs/common";
-import { ConfigModule } from "./common/config/config.module";
+import { ConfigModule as NestConfigModule } from "@nestjs/config";
 import { DatabaseModule } from "./common/database/database.module";
 import { TenantModule } from "./common/tenants/tenant.module";
 import { AuthModule } from "./common/auth/auth.module";
@@ -914,17 +934,13 @@ import { APP_GUARD } from "@nestjs/core";
 
 @Module({
   imports: [
-    ConfigModule,    // Must be first — other modules depend on env vars
-    DatabaseModule,  // Must be second — makes Drizzle available globally
-    TenantModule,    // Must be third — tenant resolution in guards
-    AuthModule,      // JWT auth
-
-    // Feature modules (order doesn't matter)
+    NestConfigModule.forRoot({ isGlobal: true }),  // Loads .env — no validation here
+    DatabaseModule,
+    TenantModule,
+    AuthModule,
     HealthModule,
   ],
   providers: [
-    // Apply guards GLOBALLY — every route must have tenant context
-    // and a valid JWT (unless overridden with @SkipAuth or public routes)
     {
       provide: APP_GUARD,
       useClass: TenantGuard,
@@ -1079,9 +1095,10 @@ wallet-api/
 └── src/
     ├── main.ts                 # NestJS + FastifyAdapter
     ├── app.module.ts           # Root module with global guards
+    ├── config/
+    │   ├── database.config.ts  # DATABASE_URL validation
+    │   └── jwt.config.ts       # JWT_SECRET validation
     ├── common/
-    │   ├── config/
-    │   │   └── config.module.ts      # Env validation with Joi
     │   ├── database/
     │   │   ├── database.module.ts    # Global Drizzle client
     │   │   ├── database.service.ts   # Drizzle wrapper with Pool
