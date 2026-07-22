@@ -1,22 +1,23 @@
-import type React from "next";
+import type React from "react";
 import type { Metadata } from "next";
-import { JetBrains_Mono, Newsreader, Space_Grotesk } from "next/font/google";
+import { JetBrains_Mono, Fraunces, Plus_Jakarta_Sans } from "next/font/google";
+import { GeistSans } from "geist/font/sans";
 import { Analytics } from "@vercel/analytics/next";
 import { Suspense } from "react";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Footer } from "@/components/footer";
 import "./globals.css";
 
-const spaceGrotesk = Space_Grotesk({
+const fraunces = Fraunces({
   subsets: ["latin"],
-  variable: "--font-space",
+  variable: "--font-fraunces",
   display: "swap",
   weight: ["400", "500", "600", "700"],
 });
 
-const newsreader = Newsreader({
+const plusJakartaSans = Plus_Jakarta_Sans({
   subsets: ["latin"],
-  variable: "--font-newsreader",
+  variable: "--font-plus-jakarta",
   display: "swap",
   weight: ["400", "500", "600", "700"],
 });
@@ -75,7 +76,7 @@ export default function RootLayout({
   return (
     <html lang="en" suppressHydrationWarning>
       <body
-        className={`${spaceGrotesk.variable} ${newsreader.variable} ${jetbrainsMono.variable} font-sans antialiased`}
+        className={`${GeistSans.variable} ${fraunces.variable} ${plusJakartaSans.variable} ${jetbrainsMono.variable} font-geist antialiased`}
       >
         <ThemeProvider attribute="class" defaultTheme="dark" enableSystem disableTransitionOnChange>
           <div className="flex min-h-dvh flex-col">

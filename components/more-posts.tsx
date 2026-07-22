@@ -21,12 +21,12 @@ export function MorePosts({ currentSlug }: MorePostsProps) {
           <Link
             key={post.slug}
             href={`/blog/${post.slug}`}
-            className="group flex items-center justify-between py-3.5 transition-colors hover:bg-accent/[0.02] -mx-3 px-3 rounded-lg"
+            className="group flex items-center justify-between py-3.5 transition-colors hover:bg-accent/[0.02] -mx-3 px-3 rounded-[4px]"
           >
-            <span className="text-[15px] font-medium text-foreground transition-colors group-hover:text-accent">
+            <span className="font-geist text-[15px] text-foreground transition-colors group-hover:text-accent">
               {post.title}
             </span>
-            <span className="shrink-0 text-[12px] text-muted-foreground">
+            <span className="shrink-0 font-geist text-[12px] text-muted-foreground">
               {new Date(post.date).toLocaleDateString("en-US", {
                 year: "numeric",
                 month: "short",

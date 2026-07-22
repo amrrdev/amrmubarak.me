@@ -9,12 +9,12 @@ export default function About() {
           <p className="text-[12px] font-semibold uppercase tracking-[0.3em] text-muted-foreground">
             About
           </p>
-          <h1 className="text-3xl font-semibold text-foreground md:text-4xl">
+          <h1 className="font-fraunces text-[32px] font-medium leading-tight text-foreground md:text-[48px]">
             Writing with a systems lens.
           </h1>
         </div>
 
-        <div className="space-y-5 font-serif text-[17px] leading-relaxed text-muted-foreground">
+        <div className="space-y-5 font-geist text-[17px] leading-relaxed text-muted-foreground">
           <p>
             I'm a distributed systems engineer with a passion for building reliable, scalable
             infrastructure. I spend my days thinking about consensus algorithms, database internals,

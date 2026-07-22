@@ -50,7 +50,7 @@ export function TableOfContents() {
 
   return (
     <aside className="sticky top-24 w-full">
-      <h4 className="mb-4 text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
+      <h4 className="mb-4 text-[12px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
         On this page
       </h4>
       <nav className="max-h-[calc(100vh-10rem)] overflow-y-auto overscroll-contain space-y-0.5 border-l border-border/40 [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-thumb]:bg-border [&::-webkit-scrollbar-track]:bg-transparent">

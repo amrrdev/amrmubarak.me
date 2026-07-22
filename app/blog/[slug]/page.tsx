@@ -41,6 +41,7 @@ export async function generateMetadata({
       description: post.content.substring(0, 160),
       type: "article",
       publishedTime: post.date,
+      authors: ["Amr Mubarak"],
       tags: [post.category],
     },
     twitter: {
@@ -70,67 +71,64 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
           <div className="min-w-0">
             <Link
               href="/blog"
-              className="mb-12 inline-flex items-center text-[12px] font-semibold uppercase tracking-[0.2em] text-muted-foreground transition-colors hover:text-foreground"
+              className="mb-12 inline-flex items-center font-geist text-[12px] text-muted-foreground transition-colors hover:text-foreground"
             >
               &larr; Back to blog
             </Link>
 
             <article>
               <header className="mb-10 space-y-6">
-                <div className="flex flex-wrap items-center gap-3 text-[12px] text-muted-foreground">
+                <div className="flex flex-wrap items-center gap-3 font-geist text-[12px] text-muted-foreground">
                   <CategoryBadge category={post.category} variant="large" />
                 </div>
-                <h1 className="text-balance text-[32px] font-semibold leading-tight tracking-tight text-foreground md:text-[40px]">
+                <h1 className="text-balance font-fraunces text-[32px] font-medium leading-tight text-foreground md:text-[48px]">
                   {post.title}
                 </h1>
                 <AuthorByline date={post.date} readTime={post.readTime} />
               </header>
 
-              <div className="prose-custom text-[17px] leading-relaxed text-foreground/92">
+              <div className="prose-custom font-geist text-[17px] leading-relaxed text-foreground/92">
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               rehypePlugins={[rehypeHighlight]}
               components={
                 {
                   h2: ({ children }: { children: React.ReactNode }) => (
-                    <h2 className="mb-4 mt-12 scroll-mt-24 text-[24px] font-semibold leading-tight text-foreground first:mt-0">
+                    <h2 className="mb-4 mt-12 scroll-mt-24 font-fraunces text-[24px] font-medium leading-tight text-foreground first:mt-0">
                       {children}
                     </h2>
                   ),
                   h3: ({ children }: { children: React.ReactNode }) => (
-                    <h3 className="mb-3 mt-10 scroll-mt-24 text-[20px] font-semibold leading-tight text-foreground">
+                    <h3 className="mb-3 mt-10 scroll-mt-24 font-fraunces text-[20px] font-medium leading-tight text-foreground">
                       {children}
                     </h3>
                   ),
                   p: ({ children }: { children: React.ReactNode }) => (
-                    <p className="mb-6 font-serif text-[17px] leading-[1.75] text-foreground/92">
+                    <p className="mb-6 font-geist text-[17px] leading-[1.8] text-foreground/92">
                       {children}
                     </p>
                   ),
                   ul: ({ children }: { children: React.ReactNode }) => (
-                    <ul className="my-6 space-y-2 pl-5 font-serif text-[17px] leading-relaxed text-foreground/92">
+                    <ul className="my-6 space-y-2 pl-5 font-geist text-[17px] leading-relaxed text-foreground/92">
                       {children}
                     </ul>
                   ),
                   ol: ({ children }: { children: React.ReactNode }) => (
-                    <ol className="my-6 space-y-2 pl-5 font-serif text-[17px] leading-relaxed text-foreground/92 list-decimal">
+                    <ol className="my-6 space-y-2 pl-5 font-geist text-[17px] leading-relaxed text-foreground/92 list-decimal">
                       {children}
                     </ol>
                   ),
                   li: ({ children }: { children: React.ReactNode }) => (
-                    <li className="relative text-[17px] leading-relaxed text-foreground/92">
+                    <li className="relative font-geist text-[17px] leading-relaxed text-foreground/92">
                       {children}
                     </li>
                   ),
-                  code: ({ inline, children, className, ...props }: any) => {
+                  code: ({ inline, children, className, ...props }: { inline?: boolean; children?: React.ReactNode; className?: string; [key: string]: unknown }) => {
                     if (inline) {
                       return (
                         <code
-                          className="rounded-md bg-muted/60 px-1.5 py-0.5 text-[13.5px] font-mono text-foreground border border-border/40"
-                          style={{
-                            fontFamily:
-                              "'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', monospace",
-                          }}
+                          className="rounded-[4px] border border-border/40 bg-code-inline-bg px-1.5 py-0.5 font-jetbrains text-[13.5px]"
+                          {...props}
                         >
                           {children}
                         </code>
@@ -139,10 +137,6 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                     return (
                       <code
                         className={className}
-                        style={{
-                          fontFamily:
-                            "'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', monospace",
-                        }}
                         {...props}
                       >
                         {children}
@@ -154,11 +148,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                     return (
                       <CodeBlock lang={lang}>
                         <pre
-                          className="code-block overflow-x-auto rounded-2xl border p-5 text-[14px] leading-[1.7] shadow-sm"
-                          style={{
-                            fontFamily:
-                              "'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', monospace",
-                          }}
+                          className="code-block overflow-x-auto rounded-[4px] border border-code-border p-5 font-jetbrains text-[11.5px] leading-[1.8] shadow-sm"
                         >
                           {children}
                         </pre>
@@ -168,7 +158,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                   a: ({ href, children }: { href?: string; children: React.ReactNode }) => (
                     <a
                       href={href}
-                      className="text-accent underline decoration-accent/40 underline-offset-4 transition-colors hover:decoration-accent"
+                      className="text-accent underline decoration-accent/30 underline-offset-4 transition-colors hover:decoration-accent"
                       target={href?.startsWith("http") ? "_blank" : undefined}
                       rel={href?.startsWith("http") ? "noopener noreferrer" : undefined}
                     >
@@ -182,7 +172,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                     <em className="italic text-foreground/90">{children}</em>
                   ),
                   blockquote: ({ children }: { children: React.ReactNode }) => (
-                    <blockquote className="my-8 border-l-2 border-accent/40 pl-5 font-serif text-[18px] italic leading-relaxed text-foreground/75">
+                    <blockquote className="my-10 border-l-[3px] border-accent/50 bg-accent/[0.02] pl-6 py-4 font-geist text-[16px] italic leading-[1.7] text-foreground/75">
                       {children}
                     </blockquote>
                   ),
@@ -193,12 +183,12 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
                       alt={alt || ""}
                       loading="lazy"
                       decoding="async"
-                      className="my-8 w-full rounded-2xl border border-border/40 bg-background shadow-sm"
+                      className="my-8 w-full rounded-[8px] border border-border/40 bg-background"
                     />
                   ),
                   table: ({ children }: { children: React.ReactNode }) => (
                     <div className="my-6 overflow-x-auto">
-                      <table className="w-full border-collapse text-[14px]">{children}</table>
+                      <table className="w-full border-collapse font-geist text-[14px]">{children}</table>
                     </div>
                   ),
                   thead: ({ children }: { children: React.ReactNode }) => (
@@ -225,7 +215,7 @@ export default async function BlogPost({ params }: { params: Promise<{ slug: str
             <ShareButtons url={postUrl} title={post.title} />
             <Link
               href="/blog"
-              className="text-[12px] font-semibold uppercase tracking-[0.2em] text-muted-foreground transition-colors hover:text-foreground"
+              className="font-geist text-[12px] text-muted-foreground transition-colors hover:text-foreground"
             >
               &larr; Back to blog
             </Link>

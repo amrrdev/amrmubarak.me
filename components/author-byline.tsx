@@ -16,8 +16,8 @@ export function AuthorByline({ date, readTime }: AuthorBylineProps) {
         className="rounded-full object-cover"
       />
       <div>
-        <p className="text-[14px] font-medium text-foreground">Amr Mubarak</p>
-        <p className="text-[12px] text-muted-foreground">
+        <p className="font-geist text-[14px] font-medium text-foreground">Amr Mubarak</p>
+        <p className="font-geist text-[12px] text-muted-foreground">
           {new Date(date).toLocaleDateString("en-US", {
             year: "numeric",
             month: "short",

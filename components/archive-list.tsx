@@ -47,7 +47,7 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
           <div className="w-full md:max-w-sm">
             <label
               htmlFor="archive-search"
-              className="text-[11px] font-semibold uppercase tracking-[0.2em] text-muted-foreground"
+              className="text-[12px] font-semibold uppercase tracking-[0.2em] text-muted-foreground"
             >
               Search posts
             </label>
@@ -59,7 +59,7 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
                 value={query}
                 onChange={(event) => setQuery(event.target.value)}
                 placeholder="Search by title, category, or content"
-                className="h-11 w-full rounded-full border border-border/60 bg-card/70 pl-10 pr-10 text-[14px] text-foreground shadow-sm transition focus:border-accent/60 focus:outline-none"
+                className="h-11 w-full rounded-[4px] border border-border bg-card pl-10 pr-10 font-geist text-[16px] text-foreground transition focus:border-accent focus:outline-none focus:ring-3 focus:ring-accent/10"
               />
               {query ? (
                 <button
@@ -73,7 +73,7 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
               ) : null}
             </div>
           </div>
-          <div className="text-[12px] text-muted-foreground">
+          <div className="font-geist text-[12px] text-muted-foreground">
             Showing {filteredPosts.length} of {posts.length} posts
           </div>
         </div>
@@ -81,10 +81,10 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
         <div className="flex flex-wrap gap-2">
           <button
             onClick={() => setSelectedCategory("all")}
-            className={`rounded-full border px-4 py-2 text-[12px] font-medium transition ${
+            className={`rounded-full border px-4 py-2 font-geist text-[11px] transition ${
               selectedCategory === "all"
-                ? "border-accent/50 bg-accent/15 text-accent shadow-sm"
-                : "border-border/60 bg-card/70 text-muted-foreground hover:border-accent/40 hover:text-foreground"
+                ? "border-accent/30 bg-accent/10 text-accent"
+                : "border-border bg-transparent text-muted-foreground hover:border-accent/30 hover:bg-accent/10 hover:text-accent"
             }`}
           >
             All ({posts.length})
@@ -97,10 +97,10 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
               <button
                 key={category}
                 onClick={() => setSelectedCategory(category)}
-                className={`rounded-full border px-4 py-2 text-[12px] font-medium transition ${
+                className={`rounded-full border px-4 py-2 font-geist text-[11px] transition ${
                   isSelected
-                    ? "border-accent/50 bg-accent/15 text-accent shadow-sm"
-                    : "border-border/60 bg-card/70 text-muted-foreground hover:border-accent/40 hover:text-foreground"
+                    ? "border-accent/30 bg-accent/10 text-accent"
+                    : "border-border bg-transparent text-muted-foreground hover:border-accent/30 hover:bg-accent/10 hover:text-accent"
                 }`}
               >
                 {category} ({count})
@@ -111,22 +111,22 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
       </div>
 
       {years.length === 0 ? (
-        <div className="rounded-2xl border border-dashed border-border/70 bg-card/60 p-8 text-center text-[14px] text-muted-foreground">
+        <div className="rounded-[8px] border border-dashed border-border bg-card/60 p-8 text-center font-geist text-[14px] text-muted-foreground">
           No posts match your search. Try a different keyword or clear the filters.
         </div>
       ) : (
         <div className="space-y-12">
           {years.map((year) => (
             <div key={year}>
-              <h2 className="mb-4 text-[14px] font-semibold uppercase tracking-[0.2em] text-accent">
+              <h2 className="mb-4 text-[12px] font-semibold uppercase tracking-[0.2em] text-muted-foreground">
                 {year}
               </h2>
               <div className="space-y-3">
                 {postsByYear[Number(year)].map((post) => (
                   <article key={post.slug}>
                     <Link href={`/blog/${post.slug}`} className="group block">
-                      <div className="rounded-2xl border border-border/60 bg-card/80 px-5 py-4 transition-all duration-200 hover:-translate-y-0.5 hover:border-accent/40 hover:shadow-md">
-                        <div className="mb-2 flex flex-wrap items-center gap-3 text-[12px] text-muted-foreground">
+                      <div className="rounded-[8px] border border-border bg-card p-5 transition-colors hover:bg-accent/[0.02]">
+                        <div className="mb-2 flex flex-wrap items-center gap-3 font-geist text-[12px] text-muted-foreground">
                           <CategoryBadge category={post.category} />
                           <span className="text-border">|</span>
                           <time className="font-medium" dateTime={post.date}>
@@ -138,7 +138,7 @@ export function ArchiveList({ posts, categories }: ArchiveListProps) {
                           <span className="text-border">|</span>
                           <span>{post.readTime}</span>
                         </div>
-                        <h2 className="text-[17px] font-medium text-foreground transition-colors group-hover:text-accent">
+                        <h2 className="font-geist text-[17px] font-medium text-foreground transition-colors group-hover:text-accent">
                           {post.title}
                         </h2>
                       </div>

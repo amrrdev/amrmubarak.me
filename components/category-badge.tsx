@@ -5,27 +5,27 @@ interface CategoryBadgeProps {
 
 const categoryColors: Record<string, { bg: string; text: string; border: string }> = {
   "Distributed Systems": {
-    bg: "bg-indigo-500/15",
-    text: "text-indigo-700 dark:text-indigo-300",
-    border: "border-indigo-500/30",
+    bg: "bg-accent/10",
+    text: "text-accent",
+    border: "border-accent/20",
   },
   "Database Internals": {
-    bg: "bg-sky-500/15",
-    text: "text-sky-700 dark:text-sky-300",
-    border: "border-sky-500/30",
+    bg: "bg-[#00D4FF]/10",
+    text: "text-[#00D4FF]",
+    border: "border-[#00D4FF]/20",
   },
   "System Design": {
-    bg: "bg-violet-500/15",
-    text: "text-violet-700 dark:text-violet-300",
-    border: "border-violet-500/30",
+    bg: "bg-[#E030EB]/10",
+    text: "text-[#E030EB]",
+    border: "border-[#E030EB]/20",
   },
   "AI Engineering": {
-    bg: "bg-rose-500/15",
-    text: "text-rose-700 dark:text-rose-300",
-    border: "border-rose-500/30",
+    bg: "bg-accent/10",
+    text: "text-accent",
+    border: "border-accent/20",
   },
   Uncategorized: {
-    bg: "bg-muted/50",
+    bg: "bg-muted/30",
     text: "text-muted-foreground",
     border: "border-border",
   },
@@ -37,7 +37,7 @@ export function CategoryBadge({ category, variant = "default" }: CategoryBadgePr
 
   return (
     <span
-      className={`inline-flex items-center rounded-full border font-medium ${colors.bg} ${colors.text} ${colors.border} ${sizeClasses}`}
+      className={`inline-flex items-center rounded-full border font-geist font-medium ${colors.bg} ${colors.text} ${colors.border} ${sizeClasses}`}
     >
       {category}
     </span>

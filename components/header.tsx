@@ -10,6 +10,7 @@ import {
   SheetTitle,
   SheetTrigger,
 } from "@/components/ui/sheet";
+import { cn } from "@/lib/utils";
 
 const navLinks = [
   { href: "/", label: "Home" },
@@ -25,11 +26,11 @@ export function Header() {
     href === "/" ? pathname === "/" : pathname.startsWith(href);
 
   return (
-    <header className="sticky top-0 z-50 border-b border-border/60 bg-background/70 backdrop-blur-xl">
+    <header className="sticky top-0 z-50 bg-background/80 backdrop-blur-md">
       <div className="mx-auto flex max-w-6xl items-center justify-between px-6 py-4">
         <Link
           href="/"
-          className="text-[15px] font-semibold uppercase tracking-[0.2em] text-foreground transition-colors hover:text-accent"
+          className="font-fraunces text-[18px] font-normal text-foreground transition-colors hover:text-accent"
         >
           Amr Mubarak
         </Link>
@@ -40,15 +41,16 @@ export function Header() {
             <Link
               key={link.href}
               href={link.href}
-              className={`relative px-3 py-2 text-[13px] font-medium transition-colors ${
+              className={cn(
+                "relative px-3 py-2 text-[12px] font-normal transition-colors",
                 isActive(link.href)
                   ? "text-foreground"
                   : "text-muted-foreground hover:text-foreground"
-              }`}
+              )}
             >
               {link.label}
               {isActive(link.href) && (
-                <span className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full bg-accent" />
+                <span className="absolute bottom-0 left-3 right-3 h-[2px] bg-accent" />
               )}
             </Link>
           ))}
@@ -63,7 +65,7 @@ export function Header() {
           <Sheet>
             <SheetTrigger asChild>
               <button
-                className="inline-flex h-9 w-9 items-center justify-center rounded-full border border-border/60 bg-card/60 text-muted-foreground transition-colors hover:border-accent/60 hover:bg-accent/10 hover:text-foreground"
+                className="inline-flex h-9 w-9 items-center justify-center rounded-[4px] border border-border/60 bg-card/60 text-muted-foreground transition-colors hover:border-accent/60 hover:bg-accent/10 hover:text-foreground"
                 aria-label="Open menu"
               >
                 <Menu className="h-4 w-4" />
@@ -76,11 +78,12 @@ export function Header() {
                   <Link
                     key={link.href}
                     href={link.href}
-                    className={`rounded-xl px-4 py-3 text-[15px] font-medium transition-colors ${
+                    className={cn(
+                      "rounded-[4px] px-4 py-3 text-[12px] font-geist transition-colors",
                       isActive(link.href)
                         ? "bg-accent/10 text-accent"
                         : "text-muted-foreground hover:bg-accent/5 hover:text-foreground"
-                    }`}
+                    )}
                   >
                     {link.label}
                   </Link>
